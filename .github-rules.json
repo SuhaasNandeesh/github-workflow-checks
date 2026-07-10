@@ -4,6 +4,18 @@
       "severity": "error",
       "description": "All external marketplace actions must be pinned to an immutable full-length commit SHA rather than tags or branches."
     },
+    "pin-setup-actions-sha": {
+      "severity": "error",
+      "description": "Setup actions (actions/setup-python, actions/setup-node, actions/setup-go, actions/setup-java) must be pinned to a commit SHA."
+    },
+    "pin-artifact-actions-sha": {
+      "severity": "error",
+      "description": "Artifact and cache actions (actions/upload-artifact, actions/download-artifact, actions/cache) must be pinned to a commit SHA."
+    },
+    "reusable-workflow-pinned": {
+      "severity": "error",
+      "description": "Reusable workflow calls (uses: org/repo/.github/workflows/*.yml@ref) must be pinned to a commit SHA."
+    },
     "coverity-scan": {
       "severity": "warning",
       "description": "Coverity SAST and secrets scanning should be configured for repository code."
@@ -34,7 +46,7 @@
     },
     "runner-shell-misalignment": {
       "severity": "error",
-      "description": "Jobs targetting Windows runner environments must specify 'shell: bash' for Linux/bash commands."
+      "description": "Jobs targeting Windows or macOS runners must specify the correct shell for the commands used."
     },
     "multiline-block-scalar": {
       "severity": "warning",
@@ -44,9 +56,57 @@
       "severity": "error",
       "description": "Circular dependency definitions in job 'needs' trees are forbidden."
     },
+    "unresolved-needs": {
+      "severity": "error",
+      "description": "Job 'needs' references must resolve to a job defined in the same workflow. Typos or missing jobs cause silent failures."
+    },
     "least-privilege-token": {
       "severity": "error",
       "description": "Limit GITHUB_TOKEN scope by setting 'permissions: {}' at the top-level workflow or job configuration."
+    },
+    "job-permission-escalation": {
+      "severity": "error",
+      "description": "Job-level permissions must not widen the workflow-level GITHUB_TOKEN scope beyond the declared default."
+    },
+    "oidc-cloud-deploy": {
+      "severity": "error",
+      "description": "Cloud deployment jobs using OIDC-based authentication (aws-actions/configure-aws-credentials, azure/login) should declare permissions: id-token: write."
+    },
+    "checkout-persist-credentials": {
+      "severity": "warning",
+      "description": "actions/checkout should set persist-credentials: false to prevent token leakage to post-checkout steps."
+    },
+    "checkout-fetch-depth": {
+      "severity": "info",
+      "description": "actions/checkout should set fetch-depth: 0 when full git history is required for audit or changelog workflows."
+    },
+    "job-timeout-missing": {
+      "severity": "warning",
+      "description": "Jobs should declare timeout-minutes to prevent hung builds from consuming runner resources."
+    },
+    "step-timeout-missing": {
+      "severity": "warning",
+      "description": "Long-running run: steps should declare timeout-minutes to prevent indefinite hangs."
+    },
+    "latest-runtime-version": {
+      "severity": "warning",
+      "description": "Runtime versions should not be set to 'latest' or 'lts/*' (non-reproducible). Pin to a specific major/minor."
+    },
+    "runner-version-pinned": {
+      "severity": "info",
+      "description": "runs-on should use a pinned version (e.g. ubuntu-22.04) instead of 'latest' for reproducibility."
+    },
+    "deprecated-set-output": {
+      "severity": "error",
+      "description": "Deprecated workflow commands (::set-output, ::set-env, ::add-path) must be replaced with env files."
+    },
+    "untrusted-input-injection": {
+      "severity": "error",
+      "description": "Writing untrusted input to $GITHUB_ENV or $GITHUB_OUTPUT without sanitization enables injection attacks."
+    },
+    "submodule-recursive": {
+      "severity": "warning",
+      "description": "actions/checkout with submodules: recursive pulls arbitrary submodules and may expose secrets."
     },
     "concurrency-control": {
       "severity": "warning",

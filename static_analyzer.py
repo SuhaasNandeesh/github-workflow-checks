@@ -1,24 +1,49 @@
-import re
-import urllib.request
 import json
 import os
-import ssl
-
+import re
+import urllib.error
+import urllib.request
 
 try:
     from ruamel.yaml.scalarstring import FoldedScalarString
 except ImportError:
     FoldedScalarString = None
 
+from logging_setup import get_logger
+from copilot_client import SSLCertificateError
+
+logger = get_logger()
+
+
+# Permission widening: maps (workflow-level, job-level) to True when
+# the job-level value is strictly wider than the workflow-level default.
+_PERMISSION_WIDENING: dict[tuple[str, str], bool] = {
+    ("read", "write"): True,
+    ("none", "read"): True,
+    ("none", "write"): True,
+}
+# "write" at workflow level means job can't widen further (it's already max),
+# and "read" at both levels is not widening.
+
+
 class StaticAnalyzer:
-    def __init__(self, rules_config=None):
+    def __init__(self, rules_config=None, token: str | None = None, endpoint: str | None = None):
         self.rules_config = rules_config or {}
+        self.token = token or os.environ.get("GITHUB_TOKEN") or os.environ.get("COPILOT_TOKEN")
+        self.endpoint = (endpoint or "https://api.github.com").rstrip("/")
         # Regex to match 40-character hex SHA
         self.sha_pattern = re.compile(r'^[a-fA-F0-9]{40}$')
         # Regex to match GitLab variables e.g., $CI_PROJECT_NAME, ${CI_COMMIT_SHA}
         self.gitlab_var_pattern = re.compile(r'\$CI_[A-Za-z0-9_]+|\$\{CI_[A-Za-z0-9_]+\}')
-        # Common secret variable suffix list
-        self.secret_suffixes = ['KEY', 'TOKEN', 'PASS', 'PASSWORD', 'SECRET', 'API_KEY', 'PAT']
+        # Default secret pattern; overridable via rules_config["secret_keyword_pattern"].
+        self.secret_keyword_pattern = re.compile(
+            self.rules_config.get(
+                "secret_keyword_pattern",
+                r'(?i)(KEY|TOKEN|PASS|PASSWORD|SECRET|API[_-]?KEY|PAT|CRED|PRIVATE[_-]?KEY|CLIENT[_-]?SECRET)',
+            )
+        )
+        # Cache for resolved action SHAs: action@tag -> sha (or None on miss)
+        self._sha_cache: dict[str, str | None] = {}
 
     def analyze_workflow(self, filepath, raw_data):
         """Runs offline static validation rules on raw parsed workflow dict."""
@@ -27,10 +52,12 @@ class StaticAnalyzer:
         if not raw_data:
             return findings
 
-        # Run checks
+        # Run global checks
         findings.extend(self._check_dependency_cycles(raw_data))
         findings.extend(self._check_least_privilege_token(raw_data))
         findings.extend(self._check_concurrency_control(raw_data))
+        findings.extend(self._check_unresolved_needs(raw_data))
+        findings.extend(self._check_oidc_cloud_deploy(raw_data))
 
         jobs = raw_data.get("jobs", {})
         if isinstance(jobs, dict):
@@ -39,7 +66,10 @@ class StaticAnalyzer:
                     continue
                 findings.extend(self._check_job_artifacts_transfer(job_id, job_data, jobs))
                 findings.extend(self._check_runner_shell_misalignment(job_id, job_data))
-                
+                findings.extend(self._check_job_permissions_escalation(job_id, job_data, raw_data))
+                findings.extend(self._check_job_timeout(job_id, job_data))
+                findings.extend(self._check_reusable_workflow_job(job_id, job_data))
+
                 steps = job_data.get("steps", [])
                 if isinstance(steps, list):
                     for idx, step in enumerate(steps):
@@ -50,6 +80,14 @@ class StaticAnalyzer:
                         findings.extend(self._check_unbound_secrets(job_id, job_data, idx, step))
                         findings.extend(self._check_multiline_block_scalar(job_id, idx, step))
                         findings.extend(self._check_enterprise_security_gates(job_id, idx, step))
+                        findings.extend(self._check_checkout_persist_credentials(job_id, idx, step))
+                        findings.extend(self._check_checkout_fetch_depth(job_id, idx, step))
+                        findings.extend(self._check_step_timeout(job_id, idx, step))
+                        findings.extend(self._check_latest_runtime_version(job_id, idx, step))
+                        findings.extend(self._check_deprecated_set_output(job_id, idx, step))
+                        findings.extend(self._check_untrusted_input_injection(job_id, idx, step))
+                        findings.extend(self._check_submodule_recursive(job_id, idx, step))
+                        findings.extend(self._check_reusable_workflow_pinned(job_id, idx, step))
 
         # Check global workflow-level security gates
         findings.extend(self._check_global_security_gates(raw_data))
@@ -97,15 +135,16 @@ class StaticAnalyzer:
         if not run_val or not isinstance(run_val, str):
             return []
 
-        matches = self.gitlab_var_pattern.findall(run_val)
-        if matches:
-            for match in set(matches):
-                findings.append({
-                    "rule": "residual-gitlab-vars",
-                    "location": f"jobs.{job_id}.steps[{step_idx}]",
-                    "message": f"Shell step contains residual GitLab CI variable reference '{match}'.",
-                    "original": match
-                })
+        # Word-boundary-aware: capture $CI_FOO or ${CI_FOO} but not
+        # $CI_FOO_BACKUP or other tokens that share a prefix.
+        for match in re.finditer(r"\$\{?CI_[A-Za-z0-9_]+\}?(?![A-Za-z0-9_])", run_val):
+            token = match.group(0)
+            findings.append({
+                "rule": "residual-gitlab-vars",
+                "location": f"jobs.{job_id}.steps[{step_idx}]",
+                "message": f"Shell step contains residual GitLab CI variable reference '{token}'.",
+                "original": token,
+            })
         return findings
 
     def _check_unbound_secrets(self, job_id, job_data, step_idx, step):
@@ -114,17 +153,20 @@ class StaticAnalyzer:
             return []
 
         findings = []
-        # Find environment variables written as $VAR or ${VAR} in shell
+        # Distinguish between GitHub context vars (github.*, runner.*, env.*,
+        # secrets.*, matrix.*, inputs.*) and arbitrary shell variables.
         shell_vars = re.findall(r'\$([A-Za-z0-9_]+)|\$\{([A-Za-z0-9_]+)\}', run_val)
         variables_used = set([v[0] or v[1] for v in shell_vars if v[0] or v[1]])
 
-        # Filter for variables containing security suffixes
-        suspicious_vars = [v for v in variables_used if any(suffix in v.upper() for suffix in self.secret_suffixes)]
+        # Filter for variables matching the secret keyword pattern.
+        suspicious_vars = [
+            v for v in variables_used
+            if self.secret_keyword_pattern.search(v) and not self._is_context_var(v)
+        ]
 
         # Collect all bound environment variables in scope (step-level + job-level + global env)
-        bound_env = set()
-        
-        # We can look up environment mappings in step.env or job.env
+        bound_env: set[str] = set()
+
         step_env = step.get("env")
         if isinstance(step_env, dict):
             bound_env.update(step_env.keys())
@@ -132,54 +174,101 @@ class StaticAnalyzer:
         if isinstance(job_env, dict):
             bound_env.update(job_env.keys())
 
-        # If a secret variable is used but not bound to any env property, flag it
+        # GITHUB_TOKEN is auto-injected by the runner; only flag if a job-level
+        # permission scope has not been verified (A7). The job-level permission
+        # check is performed separately; here we skip the variable name.
         for var in suspicious_vars:
-            # Skip GITHUB_TOKEN which is injected automatically in some runner scopes but best explicitly bound anyway
             if var == "GITHUB_TOKEN":
                 continue
             if var not in bound_env:
                 findings.append({
                     "rule": "unbound-secrets",
                     "location": f"jobs.{job_id}.steps[{step_idx}]",
-                    "message": f"Shell step references credentials variable '${var}' which is not explicitly bound in 'env' parameters.",
-                    "original": var
+                    "message": (
+                        f"Shell step references credentials variable '${var}' "
+                        "which is not explicitly bound in 'env' parameters."
+                    ),
+                    "original": var,
                 })
         return findings
 
-    def _check_runner_shell_misalignment(self, job_id, job_data):
-        runs_on = job_data.get("runs-on", "")
-        
-        # Check if Windows is targeted
-        is_windows = False
-        if isinstance(runs_on, str):
-            is_windows = "windows" in runs_on.lower() or "win" in runs_on.lower()
-        elif isinstance(runs_on, list):
-            is_windows = any("windows" in tag.lower() or "win" in tag.lower() for tag in runs_on if isinstance(tag, str))
+    @staticmethod
+    def _is_context_var(name: str) -> bool:
+        """Return True if the name refers to a GitHub Actions context expression."""
+        if "." in name:
+            return True
+        return name in {
+            "GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT", "GITHUB_SUMMARY",
+            "GITHUB_STEP_SUMMARY", "GITHUB_TOKEN", "RUNNER_OS", "RUNNER_TEMP",
+            "RUNNER_DEBUG", "CI",
+        }
 
-        if not is_windows:
+    def _check_runner_shell_misalignment(self, job_id, job_data):
+        """Bidirectional shell/runner mismatch detection (B9).
+
+        Flags:
+        - Linux commands (grep, sed, etc.) on Windows without shell: bash
+        - PowerShell cmdlets on macOS/Linux without shell: pwsh
+        - Windows-only commands on non-Windows runners
+        """
+        runs_on = job_data.get("runs-on", "")
+        runner_str = ""
+        if isinstance(runs_on, str):
+            runner_str = runs_on.lower()
+        elif isinstance(runs_on, list):
+            runner_str = " ".join(str(t).lower() for t in runs_on if isinstance(t, str))
+
+        is_windows = "windows" in runner_str or "win" in runner_str
+        is_macos   = "macos" in runner_str or "mac" in runner_str
+        is_linux   = ("ubuntu" in runner_str or "linux" in runner_str or
+                      "debian" in runner_str or "centos" in runner_str)
+        is_non_windows = is_macos or is_linux
+
+        if not is_windows and not is_non_windows:
             return []
 
         findings = []
         steps = job_data.get("steps", [])
-        if isinstance(steps, list):
-            for idx, step in enumerate(steps):
-                if not isinstance(step, dict) or "run" not in step:
-                    continue
-                
-                shell = step.get("shell")
-                if not shell:
-                    # Windows default is pwsh/cmd. If bash commands are used, this will fail.
-                    run_cmd = step["run"]
-                    # Check for Linux utilities
-                    linux_cmds = ["grep", "sed", "awk", "export", "rm -rf", "mkdir -p", "tar", "zip"]
-                    found_cmds = [cmd for cmd in linux_cmds if cmd in run_cmd]
-                    if found_cmds:
-                        findings.append({
-                            "rule": "runner-shell-misalignment",
-                            "location": f"jobs.{job_id}.steps[{idx}]",
-                            "message": f"Job runs on Windows, but step contains Linux commands {found_cmds} without setting 'shell: bash'.",
-                            "original": run_cmd
-                        })
+        if not isinstance(steps, list):
+            return findings
+
+        for idx, step in enumerate(steps):
+            if not isinstance(step, dict) or "run" not in step:
+                continue
+            shell = step.get("shell")
+            run_cmd = step["run"]
+
+            if is_windows and not shell:
+                # Windows default is pwsh/cmd — flag Linux utilities without shell: bash
+                linux_cmds = ["grep", "sed", "awk", "export", "rm -rf", "mkdir -p", "tar", "zip"]
+                found = [c for c in linux_cmds if c in run_cmd]
+                if found:
+                    findings.append({
+                        "rule": "runner-shell-misalignment",
+                        "location": f"jobs.{job_id}.steps[{idx}]",
+                        "message": f"Job runs on Windows, but step uses Linux commands {found} without setting 'shell: bash'.",
+                        "original": run_cmd,
+                    })
+
+            if is_macos and not shell:
+                # macOS default is zsh — flag PowerShell cmdlets and Windows-only commands.
+                pwsh_cmds = [
+                    "Get-ChildItem", "Select-Object", "ForEach-Object",
+                    "Where-Object", "Set-Item", "New-Item", "Remove-Item",
+                    "Write-Output", "Invoke-WebRequest", "Get-Content",
+                ]
+                win_cmds = ["powershell.exe", "cmd.exe", "winget", "msiexec"]
+                found_pwsh = [c for c in pwsh_cmds if c in run_cmd]
+                found_win  = [c for c in win_cmds  if c.lower() in run_cmd.lower()]
+                all_found  = found_pwsh + found_win
+                if all_found:
+                    findings.append({
+                        "rule": "runner-shell-misalignment",
+                        "location": f"jobs.{job_id}.steps[{idx}]",
+                        "message": f"Job runs on macOS, but step uses Windows/PowerShell commands {all_found} without setting the correct shell.",
+                        "original": run_cmd,
+                    })
+
         return findings
 
     def _check_multiline_block_scalar(self, job_id, step_idx, step):
@@ -216,6 +305,48 @@ class StaticAnalyzer:
                 "original": "write-all"
             }]
         return []
+
+    def _check_job_permissions_escalation(self, job_id, job_data, raw_data):
+        """Detect if a job-level permissions block widens the workflow-level default.
+
+        When a workflow declares `permissions: { contents: read }` and a job
+        declares `permissions: { contents: write, issues: read }`, the job
+        silently re-widens the scope, violating the least-privilege intent (A6).
+        """
+        workflow_perms = raw_data.get("permissions")
+        if not isinstance(workflow_perms, dict):
+            return []
+        job_perms = job_data.get("permissions")
+        if not isinstance(job_perms, dict):
+            return []
+
+        findings = []
+        for scope, job_value in job_perms.items():
+            workflow_value = workflow_perms.get(scope)
+            if workflow_value is None:
+                # Job declares a scope not declared at workflow level — escalation
+                findings.append({
+                    "rule": "job-permission-escalation",
+                    "location": f"jobs.{job_id}.permissions",
+                    "message": (
+                        f"Job '{job_id}' grants '{scope}: {job_value}' which is not "
+                        f"declared in the workflow-level permissions (defaulting to none). "
+                        "Either add it to the workflow-level block with the intended value, "
+                        "or remove it from the job to inherit the restrictive default."
+                    ),
+                    "original": f"{scope}: {job_value}",
+                })
+            elif _PERMISSION_WIDENING.get((workflow_value, job_value)):
+                findings.append({
+                    "rule": "job-permission-escalation",
+                    "location": f"jobs.{job_id}.permissions",
+                    "message": (
+                        f"Job '{job_id}' widens '{scope}' from workflow-level "
+                        f"'{workflow_value}' to job-level '{job_value}'."
+                    ),
+                    "original": f"{scope}: {workflow_value} -> {job_value}",
+                })
+        return findings
 
     def _check_concurrency_control(self, raw_data):
         # Deployment or publication workflows should define concurrency
@@ -422,78 +553,371 @@ class StaticAnalyzer:
         return findings
 
     def fetch_latest_sha(self, action_name, tag):
-        """Fetches the latest commit SHA from the public GitHub API for a given action and tag reference.
+        """Resolve an action's tag/branch to its immutable commit SHA.
 
-        E.g., fetch_latest_sha('actions/checkout', 'v4') -> 'a5ac7e51b41094c92402da3b24376905380afc29'
-        Handles rate limits and offline situations gracefully.
+        Subpath actions (e.g. `org/repo/sub/dir@v1`) are rejected — they
+        cannot be safely resolved by the public git-refs API (A9).
         """
-        # Parse owner and repository
         parts = action_name.split('/')
         if len(parts) < 2:
             return None
         owner, repo = parts[0], parts[1]
+        if len(parts) > 2:
+            logger.warning(
+                "Cannot resolve subpath action '%s' to a SHA via API; "
+                "use a full-length SHA instead.",
+                action_name,
+            )
+            return None
 
-        url = f"https://api.github.com/repos/{owner}/{repo}/git/ref/tags/{tag}"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Antigravity-Pipeline-Analyzer/1.0",
-                "Accept": "application/vnd.github+json"
-            }
-        )
+        cache_key = f"{owner}/{repo}@{tag}"
+        if cache_key in self._sha_cache:
+            return self._sha_cache[cache_key]
+
+        sha = self._fetch_tag_sha(owner, repo, tag)
+        self._sha_cache[cache_key] = sha
+        return sha
+
+    def _fetch_tag_sha(self, owner: str, repo: str, tag: str) -> str | None:
+        url = f"{self.endpoint}/repos/{owner}/{repo}/git/ref/tags/{tag}"
+        headers = {
+            "User-Agent": "github-actions-checks/1.0",
+            "Accept": "application/vnd.github+json",
+        }
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        req = urllib.request.Request(url, headers=headers)
 
         try:
-            context = ssl.create_default_context()
-        except Exception:
-            context = None
+            response = urllib.request.urlopen(req, timeout=5)
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429):
+                logger.warning(
+                    "Rate-limited resolving %s/%s@%s (HTTP %d); skipping.",
+                    owner, repo, tag, e.code,
+                )
+                return None
+            if e.code == 404:
+                logger.debug("%s/%s@%s not found (HTTP 404).", owner, repo, tag)
+                return None
+            logger.warning("HTTP %d resolving %s/%s@%s: %s", e.code, owner, repo, tag, e.reason)
+            return None
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, Exception) and "CERTIFICATE_VERIFY_FAILED" in str(e.reason):
+                raise SSLCertificateError(
+                    "TLS verification failed while resolving action SHAs. "
+                    "Install root certificates (see README §1) and retry."
+                ) from e
+            logger.debug("Network error resolving %s/%s@%s: %s", owner, repo, tag, e)
+            return None
+        except OSError as e:
+            logger.debug("OS error resolving %s/%s@%s: %s", owner, repo, tag, e)
+            return None
 
         try:
+            data = json.loads(response.read().decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+
+        obj = data.get("object", {})
+        if obj.get("type") == "commit":
+            return obj.get("sha")
+        if obj.get("type") == "tag":
+            tag_url = obj.get("url")
+            if not tag_url:
+                return None
+            tag_req = urllib.request.Request(
+                tag_url, headers={**headers, "Accept": "application/vnd.github+json"}
+            )
             try:
-                with urllib.request.urlopen(req, timeout=5, context=context) as response:
-                    if response.status == 200:
-                        data = json.loads(response.read().decode('utf-8'))
-                        obj = data.get("object", {})
-                        if obj.get("type") == "commit":
-                            return obj.get("sha")
-                        elif obj.get("type") == "tag":
-                            tag_url = obj.get("url")
-                            tag_req = urllib.request.Request(
-                                tag_url,
-                                headers={
-                                    "User-Agent": "Antigravity-Pipeline-Analyzer/1.0",
-                                    "Accept": "application/vnd.github+json"
-                                }
-                            )
-                            with urllib.request.urlopen(tag_req, timeout=5, context=context) as tag_response:
-                                if tag_response.status == 200:
-                                    tag_data = json.loads(tag_response.read().decode('utf-8'))
-                                    return tag_data.get("object", {}).get("sha")
-            except Exception as e:
-                # SSL verification failure fallback
-                if "CERTIFICATE_VERIFY_FAILED" in str(e):
-                    unverified_context = ssl._create_unverified_context()
-                    with urllib.request.urlopen(req, timeout=5, context=unverified_context) as response:
-                        if response.status == 200:
-                            data = json.loads(response.read().decode('utf-8'))
-                            obj = data.get("object", {})
-                            if obj.get("type") == "commit":
-                                return obj.get("sha")
-                            elif obj.get("type") == "tag":
-                                tag_url = obj.get("url")
-                                tag_req = urllib.request.Request(
-                                    tag_url,
-                                    headers={
-                                        "User-Agent": "Antigravity-Pipeline-Analyzer/1.0",
-                                        "Accept": "application/vnd.github+json"
-                                    }
-                                )
-                                with urllib.request.urlopen(tag_req, timeout=5, context=unverified_context) as tag_response:
-                                    if tag_response.status == 200:
-                                        tag_data = json.loads(tag_response.read().decode('utf-8'))
-                                        return tag_data.get("object", {}).get("sha")
-                else:
-                    raise e
-        except Exception:
-            # Network issue, rate limited, or private repo - fail gracefully
-            pass
+                tag_resp = urllib.request.urlopen(tag_req, timeout=5)
+            except (urllib.error.URLError, OSError) as e:
+                logger.debug("Failed to follow tag URL for %s/%s@%s: %s", owner, repo, tag, e)
+                return None
+            try:
+                tag_data = json.loads(tag_resp.read().decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return None
+            return tag_data.get("object", {}).get("sha")
         return None
+
+    # ─── PR 3: New rule implementations ────────────────────────────────
+
+    def _check_unresolved_needs(self, raw_data):
+        """Flag any needs: reference that doesn't resolve to a known job id (B8)."""
+        jobs = raw_data.get("jobs", {})
+        if not isinstance(jobs, dict):
+            return []
+        findings = []
+        for job_id, job_data in jobs.items():
+            if not isinstance(job_data, dict):
+                continue
+            needs = job_data.get("needs", [])
+            if isinstance(needs, str):
+                needs = [needs]
+            if not isinstance(needs, list):
+                continue
+            for dep in needs:
+                if not isinstance(dep, str):
+                    continue
+                if dep not in jobs:
+                    findings.append({
+                        "rule": "unresolved-needs",
+                        "location": f"jobs.{job_id}",
+                        "message": (
+                            f"Job '{job_id}' depends on '{dep}' which is not defined "
+                            "in this workflow. Check for typos or missing job definitions."
+                        ),
+                        "original": f"needs: {dep}",
+                    })
+        return findings
+
+    def _check_job_timeout(self, job_id, job_data):
+        """Flag jobs without timeout-minutes."""
+        if "timeout-minutes" not in job_data:
+            return [{
+                "rule": "job-timeout-missing",
+                "location": f"jobs.{job_id}",
+                "message": f"Job '{job_id}' does not declare 'timeout-minutes'. Hung builds may consume runner resources indefinitely.",
+                "original": "missing",
+            }]
+        return []
+
+    def _check_reusable_workflow_job(self, job_id, job_data):
+        """Flag job-level uses: org/repo/.github/workflows/file.yml@ref where ref is not a SHA."""
+        uses_val = job_data.get("uses", "")
+        if not uses_val or not isinstance(uses_val, str):
+            return []
+        if "/.github/workflows/" not in uses_val:
+            return []
+        if "@" not in uses_val:
+            return [{
+                "rule": "reusable-workflow-pinned",
+                "location": f"jobs.{job_id}",
+                "message": f"Reusable workflow '{uses_val}' has no version reference. Pin to a commit SHA.",
+                "original": uses_val,
+            }]
+        parts = uses_val.split("@")
+        ref = parts[1] if len(parts) > 1 else ""
+        if not self.sha_pattern.match(ref):
+            return [{
+                "rule": "reusable-workflow-pinned",
+                "location": f"jobs.{job_id}",
+                "message": f"Reusable workflow '{uses_val.split('@')[0]}' is pinned to tag/branch '{ref}' instead of an immutable SHA.",
+                "original": uses_val,
+            }]
+        return []
+
+    def _check_checkout_persist_credentials(self, job_id, idx, step):
+        """Flag actions/checkout without persist-credentials: false."""
+        uses_val = step.get("uses", "")
+        if not uses_val or not isinstance(uses_val, str):
+            return []
+        if "actions/checkout" not in uses_val:
+            return []
+        with_block = step.get("with") or {}
+        if not isinstance(with_block, dict):
+            with_block = {}
+        persist = with_block.get("persist-credentials")
+        if persist is not False and str(persist).lower() != "false":
+            return [{
+                "rule": "checkout-persist-credentials",
+                "location": f"jobs.{job_id}.steps[{idx}]",
+                "message": "actions/checkout should set 'persist-credentials: false' to prevent the token from persisting in post-checkout steps.",
+                "original": uses_val,
+            }]
+        return []
+
+    def _check_checkout_fetch_depth(self, job_id, idx, step):
+        """Flag actions/checkout with fetch-depth: 0 when not explicitly needed."""
+        uses_val = step.get("uses", "")
+        if not uses_val or not isinstance(uses_val, str):
+            return []
+        if "actions/checkout" not in uses_val:
+            return []
+        with_block = step.get("with") or {}
+        if not isinstance(with_block, dict):
+            with_block = {}
+        depth = with_block.get("fetch-depth")
+        if depth == 0:
+            return [{
+                "rule": "checkout-fetch-depth",
+                "location": f"jobs.{job_id}.steps[{idx}]",
+                "message": "actions/checkout uses fetch-depth: 0 (full history clone). Ensure this is intentional.",
+                "original": str(uses_val),
+            }]
+        return []
+
+    def _check_step_timeout(self, job_id, idx, step):
+        """Flag long run: steps without timeout-minutes."""
+        if "run" not in step:
+            return []
+        if "timeout-minutes" in step:
+            return []
+        run_cmd = str(step.get("run", ""))
+        lines = [l for l in run_cmd.split("\n") if l.strip()]
+        if len(lines) > 15:
+            return [{
+                "rule": "step-timeout-missing",
+                "location": f"jobs.{job_id}.steps[{idx}]",
+                "message": f"Step has {len(lines)} lines of script without timeout-minutes. Consider adding a timeout to prevent indefinite hangs.",
+                "original": f"{len(lines)} lines",
+            }]
+        return []
+
+    def _check_latest_runtime_version(self, job_id, idx, step):
+        """Flag setup actions with *-version: latest or lts/*."""
+        uses_val = step.get("uses", "")
+        if not uses_val or not isinstance(uses_val, str):
+            return []
+        setup_actions = (
+            "actions/setup-python", "actions/setup-node", "actions/setup-go",
+            "actions/setup-java", "actions/setup-ruby", "actions/setup-dotnet",
+        )
+        is_setup = any(f"actions/setup-" in u for u in [uses_val])
+        if not is_setup:
+            return []
+        with_block = step.get("with") or {}
+        if not isinstance(with_block, dict):
+            return []
+        for key, val in with_block.items():
+            if not key.endswith("-version") or not isinstance(val, str):
+                continue
+            if val.lower() in ("latest", "lts", "lts/*", "lts/*", "stable"):
+                return [{
+                    "rule": "latest-runtime-version",
+                    "location": f"jobs.{job_id}.steps[{idx}]",
+                    "message": f"Setup action '{uses_val}' uses '{key}: {val}' which is non-reproducible. Pin to a specific version.",
+                    "original": f"{key}: {val}",
+                }]
+        return []
+
+    def _check_deprecated_set_output(self, job_id, idx, step):
+        """Flag deprecated ::set-output, ::set-env, ::add-path workflow commands."""
+        run_cmd = step.get("run")
+        if not run_cmd or not isinstance(run_cmd, str):
+            return []
+        patterns = [
+            (r"::set-output\s+name=", "::set-output"),
+            (r"::set-env\s+name=", "::set-env"),
+            (r"::add-path\s+", "::add-path"),
+        ]
+        for pattern, label in patterns:
+            if re.search(pattern, run_cmd):
+                return [{
+                    "rule": "deprecated-set-output",
+                    "location": f"jobs.{job_id}.steps[{idx}]",
+                    "message": f"Workflow command '{label}' is deprecated and disabled. Use >> \"$GITHUB_OUTPUT\" or >> \"$GITHUB_ENV\" instead.",
+                    "original": label,
+                }]
+        return []
+
+    def _check_untrusted_input_injection(self, job_id, idx, step):
+        """Flag GITHUB_ENV/GITHUB_OUTPUT writes from untrusted context expressions."""
+        run_cmd = step.get("run")
+        if not run_cmd or not isinstance(run_cmd, str):
+            return []
+        # Match: untrusted github context → $GITHUB_ENV or $GITHUB_OUTPUT
+        untrusted = r"""\$\{\{\s*github\.(event\.\w+[\.\w]*|head_ref|pull_request\.\w+|issue\.\w+)\s*\}\}"""
+        env_sink = re.compile(untrusted + r""".*>>\s*["']?\$GITHUB_ENV["']?""")
+        output_sink = re.compile(untrusted + r""".*>>\s*["']?\$GITHUB_OUTPUT["']?""")
+        if env_sink.search(run_cmd) or output_sink.search(run_cmd):
+            return [{
+                "rule": "untrusted-input-injection",
+                "location": f"jobs.{job_id}.steps[{idx}]",
+                "message": "Untrusted github context is written directly to $GITHUB_ENV or $GITHUB_OUTPUT. Sanitize before assignment to prevent injection.",
+                "original": run_cmd[:200],
+            }]
+        return []
+
+    def _check_submodule_recursive(self, job_id, idx, step):
+        """Flag actions/checkout with submodules: recursive."""
+        uses_val = step.get("uses", "")
+        if not uses_val or not isinstance(uses_val, str):
+            return []
+        if "actions/checkout" not in uses_val:
+            return []
+        with_block = step.get("with") or {}
+        if not isinstance(with_block, dict):
+            return []
+        subs = with_block.get("submodules")
+        if subs is True or str(subs).lower() == "recursive":
+            return [{
+                "rule": "submodule-recursive",
+                "location": f"jobs.{job_id}.steps[{idx}]",
+                "message": "actions/checkout uses 'submodules: recursive' which pulls arbitrary submodules and may expose secrets or introduce supply-chain risk.",
+                "original": str(uses_val),
+            }]
+        return []
+
+    def _check_reusable_workflow_pinned(self, job_id, idx, step):
+        """Flag reusable workflow calls (uses: org/repo/.github/workflows/...@ref) where ref is not a SHA."""
+        uses_val = step.get("uses", "")
+        if not uses_val or not isinstance(uses_val, str):
+            return []
+        # Reusable workflow syntax: org/repo/.github/workflows/file.yml@ref
+        if "/.github/workflows/" not in uses_val:
+            return []
+        if "@" not in uses_val:
+            return [{
+                "rule": "reusable-workflow-pinned",
+                "location": f"jobs.{job_id}.steps[{idx}]",
+                "message": f"Reusable workflow '{uses_val}' has no version reference. Pin to a commit SHA.",
+                "original": uses_val,
+            }]
+        parts = uses_val.split("@")
+        ref = parts[1] if len(parts) > 1 else ""
+        if not self.sha_pattern.match(ref):
+            return [{
+                "rule": "reusable-workflow-pinned",
+                "location": f"jobs.{job_id}.steps[{idx}]",
+                "message": f"Reusable workflow '{uses_val.split('@')[0]}' is pinned to tag/branch '{ref}' instead of an immutable SHA.",
+                "original": uses_val,
+            }]
+        return []
+
+    def _check_oidc_cloud_deploy(self, raw_data):
+        """Flag cloud-deploy actions without permissions: id-token: write."""
+        OIDC_ACTIONS = ("aws-actions/configure-aws-credentials", "azure/login", "google-github-actions/auth")
+        OIDC_SCRIPTS = ("aws-actions/configure-aws-credentials", "azure/login", "google-github-actions/auth")
+
+        jobs = raw_data.get("jobs", {})
+        if not isinstance(jobs, dict):
+            return []
+        findings = []
+        for job_id, job_data in jobs.items():
+            if not isinstance(job_data, dict):
+                continue
+            steps = job_data.get("steps", [])
+            if not isinstance(steps, list):
+                continue
+            has_oidc = False
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                uses_val = step.get("uses", "")
+                if any(a in uses_val for a in OIDC_ACTIONS):
+                    has_oidc = True
+                    break
+                run_cmd = step.get("run", "")
+                if isinstance(run_cmd, str) and any(a in run_cmd for a in OIDC_SCRIPTS):
+                    has_oidc = True
+                    break
+            if not has_oidc:
+                continue
+            job_perms = job_data.get("permissions")
+            if isinstance(job_perms, dict) and job_perms.get("id-token") in ("write", "read"):
+                continue
+            workflow_perms = raw_data.get("permissions")
+            if isinstance(workflow_perms, dict) and workflow_perms.get("id-token") in ("write", "read"):
+                continue
+            findings.append({
+                "rule": "oidc-cloud-deploy",
+                "location": f"jobs.{job_id}",
+                "message": (
+                    f"Job '{job_id}' uses an OIDC-based cloud deploy action but does not declare "
+                    "'permissions: id-token: write'. The job may fail to authenticate."
+                ),
+                "original": "missing",
+            })
+        return findings

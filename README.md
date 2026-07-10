@@ -1,6 +1,6 @@
 # GitHub Actions Pipeline Migration Analyzer
 
-An autonomous, offline-first multi-agent framework designed to scan, analyze, document, and remediate GitHub Actions workflow pipelines across multiple repositories during a GitLab-to-GHES migration. 
+An autonomous, offline-first multi-agent framework designed to scan, analyze, document, and remediate GitHub Actions workflow pipelines across multiple repositories during a GitLab-to-GitHub Enterprise Server (GHES) migration.
 
 The framework is optimized for high credit efficiency under VS Code / GitHub Copilot Enterprise subscriptions (consuming from your monthly 4,000 credit limit) by utilizing a **Static-First, Hybrid-Remediation Architecture**.
 
@@ -17,7 +17,7 @@ The system uses a sequential primary-to-subagent delegation pattern. Standard st
  ┌───────────────────────┐
  │  Orchestrator Agent   │ ◄─── Loads rules from .github-rules.json
  └───────────┬───────────┘
-             │ (Sequentially Audits Files)
+             │ (Parallel or Sequential Audits)
              ▼
  ┌───────────────────────┐
  │ Static Auditor Agent  │ (0 Credit Cost: regex, syntax, dependency loops)
@@ -34,7 +34,7 @@ The system uses a sequential primary-to-subagent delegation pattern. Standard st
  ┌───────────────────────┐                    ┌───────────────────────┐
  │    Fixer Agent        │                    │   Documenter Agent    │
  └───────────┬───────────┘                    └────────────┬──────────┘
-             │ (Remediates target block)                   │ (Generates markdown report)
+             │ (JSON Patch: RFC 6902)                      │ (Generates markdown report)
              ▼                                             ▼
  ┌───────────────────────┐                    ┌───────────────────────┐
  │   ruamel.yaml writer  │                    │      findings.md      │
@@ -42,11 +42,11 @@ The system uses a sequential primary-to-subagent delegation pattern. Standard st
 ```
 
 ### The 5 Cooperating Agents:
-1.  **Primary Orchestrator Agent (Programmatic)**: The main loop controller. Traverses directory workspaces, parses configurations, schedules sub-agent validations, and handles the self-correcting validation loop.
-2.  **Static Auditor Agent (Programmatic)**: Performs regex rules and structural cycle checks locally (0 credit cost).
-3.  **Semantic Auditor Agent (LLM)**: Analyzes the parsed AST JSON against security policies, runner alignments, and complex pipeline structures.
-4.  **Documenter Agent (LLM)**: Compiles the final compliance markdown report detailing issue locations, severity logs, and copy-pasteable YAML fixes.
-5.  **Fixer Agent (LLM)**: Rewrites complex shell steps, handles environment secrets binding, and validates formatting syntax round-trip.
+1.  **Primary Orchestrator Agent (Programmatic)**: The main loop controller. Traverses directory workspaces, parses configurations, schedules sub-agent validations, handles parallel execution, credit budget enforcement, and the self-correcting validation loop.
+2.  **Static Auditor Agent (Programmatic)**: Performs regex rules, structural cycle checks, and AST-based validation locally (0 credit cost). Supports 30+ rules including action pinning, secret binding, shell misalignment, and more.
+3.  **Semantic Auditor Agent (LLM)**: Analyzes the parsed AST JSON against security policies, runner alignments, Coverity/BDBA gates, and complex pipeline structures. Returns structured findings with severity classifications.
+4.  **Documenter Agent (LLM)**: Compiles the final compliance markdown report detailing job summaries, security posture, and prioritized remediation recommendations.
+5.  **Fixer Agent (LLM)**: Outputs JSON Patch (RFC 6902) operations for precise YAML modifications. Handles secret binding, GitLab variable replacement, and formatting alignment.
 
 ---
 
@@ -54,21 +54,31 @@ The system uses a sequential primary-to-subagent delegation pattern. Standard st
 
 ```
 github-actions-checks/
-├── .github-rules.json      # Central rules, severity profiles, and suppressions
-├── README.md               # User onboarding and workflow documentation
-├── requirements.txt        # Python dependency specifications
-├── cli.py                  # CLI entry point
-├── parser.py               # Round-trip ruamel.yaml parser and AST extractor
-├── static_analyzer.py      # Programmatic regex and dependency validation rules
-├── copilot_client.py       # Authentication wrapper and Copilot chat endpoint client
-├── agent_orchestrator.py   # Multi-agent queue scheduler and correction controller
-├── reporter.py             # Formatter layouts and offline report fallback generator
-├── agents/                 # LLM System Prompts
+├── .github-rules.json       # Central rules, severity profiles, and suppressions
+├── README.md                # User onboarding and workflow documentation
+├── requirements.txt         # Python dependency specifications
+├── cli.py                   # CLI entry point (argparse)
+├── parser.py                # Round-trip ruamel.yaml parser and AST extractor
+├── static_analyzer.py       # Programmatic regex and structural validation rules
+├── copilot_client.py        # Auth wrapper + Copilot/GHES chat endpoint client
+├── agent_orchestrator.py    # Multi-agent scheduler, parallel executor, budget control
+├── reporter.py              # Markdown/SARIF/JUnit report generators
+├── state_db.py              # Atomic file-locking state DB for resume support
+├── rules_schema.py          # JSON Schema validation for .github-rules.json
+├── logging_setup.py         # Structured logging configuration
+├── agents/                  # LLM System Prompts
 │   ├── semantic_auditor_prompt.txt
+│   ├── auditor_prompt.txt
 │   ├── documenter_prompt.txt
 │   └── fixer_prompt.txt
-├── templates/              # (Optional) Golden corporate template workflows
-└── tests/                  # Verification suites and mock repositories
+├── templates/               # (Optional) Golden corporate template workflows
+└── tests/                   # Verification suites and mock repositories
+    ├── test_pr1.py          # Parser, state_db, schema, logging tests
+    ├── test_pr2.py          # Static analyzer rule tests
+    ├── test_pr3.py          # Extended rule tests (30+ rules)
+    ├── test_pr4.py          # Prompt schema, reporter completeness tests
+    ├── test_pr5.py          # GHES, parallel, budget tests
+    └── test_state_db.py     # State DB unit tests
 ```
 
 ---
@@ -78,7 +88,7 @@ github-actions-checks/
 ### 1. Prerequisites
 Ensure you have Python 3.8+ installed on your machine.
 
-Open your VS Code terminal and install the round-trip YAML library:
+Open your VS Code terminal and install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
@@ -91,7 +101,7 @@ pip install -r requirements.txt
 > *(Replace `3.x` with your specific installed Python directory name, e.g., `3.11`)*
 
 ### 2. Authenticate with GitHub Copilot
-The LLM agents consume credits directly from your GitHub Copilot subscription. The framework automatically attempts to extract your active Copilot OAuth session credentials. 
+The LLM agents consume credits directly from your GitHub Copilot subscription. The framework automatically attempts to extract your active Copilot OAuth session credentials.
 
 To ensure authentication succeeds:
 *   Make sure you are logged into the **GitHub Copilot** extension in your current VS Code instance.
@@ -100,6 +110,19 @@ To ensure authentication succeeds:
     gh auth login
     ```
     This authenticates your command-line environment and allows the client to fetch your session token via `gh auth token`.
+
+### 3. GitHub Enterprise Server (GHES) Support
+The framework supports self-hosted GHES endpoints. Configure a custom endpoint via CLI or environment:
+
+```bash
+# Via CLI flag
+python3 cli.py --mode report --dir ./repos --endpoint https://github.mycompany.com
+
+# Via rules config (.github-rules.json)
+{"endpoint": "https://github.mycompany.com", "model": "gpt-4o", ...}
+```
+
+For GHES, the client resolves host-specific tokens via `gh auth token --hostname <host>`.
 
 ---
 
@@ -125,7 +148,19 @@ Performs the analysis, applies programmatic patches, runs the Fixer Agent to res
 python3 cli.py --mode fix --dir /path/to/downloaded/repositories
 ```
 
-### D. Custom Templates Injection (Optional)
+### D. Parallel Execution
+Process multiple workflow files concurrently for faster audits across large repository sets:
+```bash
+python3 cli.py --mode report --dir /path/to/repositories --parallel 4
+```
+
+### E. Credit Budget Control
+Abort the audit if LLM credit consumption exceeds a threshold to prevent unexpected costs:
+```bash
+python3 cli.py --mode report --dir /path/to/repositories --max-credits 50
+```
+
+### F. Custom Templates Injection (Optional)
 To align the agents' recommendations with your corporate templates:
 1.  Create a folder named `templates/` in the script directory.
 2.  Add your golden standard workflow YAML configurations (e.g. `dotnet-pipeline.yml`, `node-build.yml`).
@@ -135,10 +170,10 @@ To align the agents' recommendations with your corporate templates:
 
 ## Customizing Scan Rules (`.github-rules.json`)
 
-You can edit [.github-rules.json](file:///Users/suhaasnandeesh/Code/scripts/github-actions-checks/.github-rules.json) to control severities or suppress warnings:
+You can edit [.github-rules.json](.github-rules.json) to control severities or suppress warnings:
 
 *   **Change Severity**: Set a rule to `error` (blocks and auto-fixes), `warning` (reports but does not block), or `ignore`.
-*   **Built-in Fallbacks**: If the rules configuration JSON file is missing or fails to load, the analyzer automatically falls back onto built-in defaults (e.g., `pin-action-sha` and `least-privilege-token` are classified as errors, and BDBA/Coverity/JFrog image pushes are warnings) to guarantee correct report classifications.
+*   **Built-in Fallbacks**: If the rules configuration JSON file is missing or fails to load, the analyzer automatically falls back onto built-in defaults to guarantee correct report classifications.
 *   **Suppress Warnings**:
     ```json
     "suppressions": {
@@ -155,9 +190,34 @@ You can edit [.github-rules.json](file:///Users/suhaasnandeesh/Code/scripts/gith
 
 When running audits across dozens of repositories, runs can be interrupted by network drops, manual stops, or system reboots. To prevent starting from scratch, the Orchestrator implements automatic state saving:
 
-1.  **State File (`.actions_audit_state.json`)**: Tracks processed files in real time. Progress metrics are saved immediately after each individual workflow file is parsed.
-2.  **File Sync & Recheck**: On restart, the scanner compares the OS modification timestamp (`mtime`) of each workflow. If a file was not edited since the last successful audit, it is skipped. If it has changed, it is re-audited automatically.
+1.  **Atomic State DB (`.actions_audit_state.json`)**: Uses file-level locking for safe concurrent writes. Tracks processed files with content SHA-256 hashes and OS modification timestamps.
+2.  **Resume Logic**: On restart, the scanner compares both the content hash and mtime of each workflow. Files unchanged since the last audit are automatically skipped.
 3.  **Forcing a Fresh Run**: To clear the resume cache and run a full audit from scratch, pass the `--reset` flag:
     ```bash
     python3 cli.py --mode report --dir /path/to/repositories --reset
     ```
+
+---
+
+## Output Formats
+
+The reporter supports multiple output formats:
+- **Markdown** (default): Structured `findings.md` with severity dashboard, per-rule findings, and YAML fix snippets.
+- **SARIF** (2.1.0): Machine-readable format for integration with GitHub Advanced Security, Dependabot, and IDE code scanners.
+- **JUnit XML**: CI test reporter format for pipeline pass/fail gates.
+
+Select the format via the `--output-format` flag:
+```bash
+python3 cli.py --mode report --dir ./repos --output-format sarif
+```
+
+---
+
+## Testing
+
+Run the full test suite:
+```bash
+python3 -m pytest tests/ -v
+```
+
+The suite covers: parser correctness, static analyzer rules, state DB atomic writes, reporter output formats, prompt schema validation, GHES endpoint support, parallel execution, and credit budget enforcement.
