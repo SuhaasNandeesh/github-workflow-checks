@@ -1,4 +1,13 @@
 {
+  "models": {
+    "semantic": "claude-haiku-4.5",
+    "fixer": "claude-haiku-4.5",
+    "documenter": "claude-sonnet-5",
+    "portfolio": "claude-opus-4.8"
+  },
+  "semantic_audit": {
+    "enabled": true
+  },
   "rules": {
     "pin-action-sha": {
       "severity": "error",
@@ -18,19 +27,23 @@
     },
     "coverity-scan": {
       "severity": "warning",
-      "description": "Coverity SAST and secrets scanning should be configured for repository code."
+      "description": "Coverity SAST and secrets scanning should be configured for repository code.",
+      "applies_to": ["source", "image"]
     },
     "image-build-jfrog": {
       "severity": "warning",
-      "description": "Workflow must configure building and pushing Docker images to the JFrog Artifactory registry."
+      "description": "Workflow must configure building and pushing Docker images to the JFrog Artifactory registry.",
+      "applies_to": ["image"]
     },
     "image-signing": {
       "severity": "warning",
-      "description": "Container images pushed to JFrog registry must be signed using Cosign."
+      "description": "Container images pushed to JFrog registry must be signed using Cosign.",
+      "applies_to": ["image"]
     },
     "bdba-scan": {
       "severity": "warning",
-      "description": "Black Duck Binary Analysis (BDBA) vulnerability scans should execute on container images pulled from the JFrog registry."
+      "description": "Black Duck Binary Analysis (BDBA) vulnerability scans should execute on container images pulled from the JFrog registry.",
+      "applies_to": ["image"]
     },
     "residual-gitlab-vars": {
       "severity": "error",
@@ -76,10 +89,6 @@
       "severity": "warning",
       "description": "actions/checkout should set persist-credentials: false to prevent token leakage to post-checkout steps."
     },
-    "checkout-fetch-depth": {
-      "severity": "info",
-      "description": "actions/checkout should set fetch-depth: 0 when full git history is required for audit or changelog workflows."
-    },
     "job-timeout-missing": {
       "severity": "warning",
       "description": "Jobs should declare timeout-minutes to prevent hung builds from consuming runner resources."
@@ -111,6 +120,50 @@
     "concurrency-control": {
       "severity": "warning",
       "description": "Configure concurrency groups on deployment or state-modifying pipelines to avoid execution collisions."
+    },
+    "pull-request-target-danger": {
+      "severity": "error",
+      "description": "Jobs triggered by pull_request_target that check out PR head code execute with write secrets — a critical supply-chain vulnerability. Avoid checkout of PR refs under pull_request_target, or run only trusted actions."
+    },
+    "self-hosted-runner-public-repo": {
+      "severity": "warning",
+      "description": "runs-on: self-hosted on a public repository exposes the runner to untrusted code execution. Use GitHub-hosted runners or label-gated self-hosted runners only on private repos."
+    },
+    "secret-in-run-literal": {
+      "severity": "error",
+      "description": "Hardcoded credentials (passwords, API keys, private keys) embedded directly in run: scripts are exposed in logs and git history."
+    },
+    "secret-echoed-in-logs": {
+      "severity": "error",
+      "description": "Secrets interpolated directly into run: commands via ${{ secrets.* }} are echoed in workflow logs. Bind them through env: instead."
+    },
+    "expression-in-run-injection": {
+      "severity": "error",
+      "description": "Untrusted ${{ github.event.* }} expressions interpolated directly into run: commands enable script injection. Assign to env: first."
+    },
+    "environment-protection": {
+      "severity": "warning",
+      "description": "Deployment/release jobs should declare an environment: with required reviewers for production protection."
+    },
+    "docker-action-digest-pin": {
+      "severity": "warning",
+      "description": "Docker actions (docker://) and container services should be pinned by immutable digest, not mutable tag."
+    },
+    "missing-set-x-pipefail": {
+      "severity": "info",
+      "description": "Multi-line bash run: scripts should start with 'set -e -o pipefail' so failures surface instead of being masked."
+    },
+    "token-passed-to-third-party": {
+      "severity": "warning",
+      "description": "GITHUB_TOKEN or secrets passed via env: to third-party (non-first-party) actions may be exfiltrated. Audit the action's trust level."
+    },
+    "always-deploy-after-failure": {
+      "severity": "error",
+      "description": "A deployment job gated on a test/build job with if: always() deploys even when the upstream job fails. Use if: success() or needs.<job>.result == 'success'."
+    },
+    "matrix-fail-fast": {
+      "severity": "info",
+      "description": "matrix jobs with fail-fast: true abort the entire matrix on the first failure, hiding later failures. Consider fail-fast: false for diagnostics."
     }
   },
   "suppressions": {

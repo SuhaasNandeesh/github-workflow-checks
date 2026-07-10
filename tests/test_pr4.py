@@ -69,9 +69,13 @@ class TestAuditorPromptSchema:
             "Auditor prompt must reference JSON Schema."
 
     def test_severity_enum(self):
+        # Phase 1: the semantic auditor no longer emits severities (they are
+        # owned by .github-rules.json). Instead it must reference the rules list.
         text = self._load()
-        for sev in ("critical", "high", "medium", "low", "info"):
-            assert f'"{sev}"' in text or f"'{sev}'" in text, f"Auditor prompt must list severity '{sev}'."
+        assert "rules" in text.lower(), "Auditor prompt must reference the active rules list."
+        assert "severity" in text.lower() or "Severity" in text, (
+            "Auditor prompt must note that severity is not emitted by the LLM."
+        )
 
     def test_few_shot_present(self):
         text = self._load()
@@ -84,7 +88,8 @@ class TestDocumenterPromptSchema:
 
     def test_mentions_jobs_array(self):
         text = self._load()
-        assert '"jobs"' in text or "'jobs'" in text, "Documenter prompt must specify a 'jobs' array."
+        # Documenter prompt now emits Markdown and references per-job sections.
+        assert "jobs" in text.lower() or "Jobs" in text, "Documenter prompt must reference jobs."
 
     def test_few_shot_present(self):
         text = self._load()
@@ -140,12 +145,19 @@ class TestReporterUncategorized:
             "pin-action-sha", "pin-setup-actions-sha", "pin-artifact-actions-sha",
             "reusable-workflow-pinned", "coverity-scan", "image-build-jfrog",
             "image-signing", "bdba-scan", "concurrency-control", "least-privilege-token",
-            "oidc-cloud-deploy", "checkout-persist-credentials", "checkout-fetch-depth",
+            "oidc-cloud-deploy", "checkout-persist-credentials",
             "job-timeout-missing", "step-timeout-missing", "runner-version-pinned",
             "deprecated-set-output", "untrusted-input-injection", "submodule-recursive",
             "job-permission-escalation", "residual-gitlab-vars", "runner-shell-misalignment",
             "explicit-artifact-transfer", "unbound-secrets", "multiline-block-scalar",
             "job-dependency-cycle", "unresolved-needs", "latest-runtime-version",
+            # Phase 5 new rules
+            "pull-request-target-danger", "self-hosted-runner-public-repo",
+            "secret-in-run-literal", "secret-echoed-in-logs",
+            "expression-in-run-injection", "environment-protection",
+            "docker-action-digest-pin", "missing-set-x-pipefail",
+            "token-passed-to-third-party", "always-deploy-after-failure",
+            "matrix-fail-fast",
         ]
         for rule in rules_with_suggestions:
             result = ReportGenerator._get_suggestion(rule, "owner/action@v4")

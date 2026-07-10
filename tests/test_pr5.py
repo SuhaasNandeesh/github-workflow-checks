@@ -1,4 +1,4 @@
-"""Tests for PR 5: GHES client, parallel processing, credit budget."""
+"""Tests for client simplification: token resolution, parallel processing, credit budget."""
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
@@ -17,77 +17,35 @@ from copilot_client import CopilotClient
 _MINIMAL_RULES_CONFIG = '{"rules": {"pin-action-sha": {"severity": "error", "description": "test"}}, "suppressions": {"global": [], "by_repository": {}}}'
 
 
-# ── GHES endpoint support ─────────────────────────────────────────────────────
+# ── Token resolution ──────────────────────────────────────────────────────────
 
 
-class TestGHESDetection:
-    def test_ghes_returns_true_for_non_github_com(self):
-        client = CopilotClient(
-            model_name="test",
-            endpoint="https://github.mycompany.com",
-            token="tok",
-        )
-        assert client._is_ghes() is True
-
-    def test_ghes_returns_false_for_github_com(self):
-        client = CopilotClient(
-            model_name="test",
-            endpoint="https://api.githubcopilot.com",
-            token="tok",
-        )
-        assert client._is_ghes() is False
-
-    def test_ghes_host_extracts_hostname(self):
-        client = CopilotClient(
-            model_name="test",
-            endpoint="https://github.mycompany.com/api/v3",
-            token="tok",
-        )
-        assert client._ghes_host() == "github.mycompany.com"
-
-    def test_ghes_host_returns_none_for_github_com(self):
-        client = CopilotClient(
-            model_name="test",
-            endpoint="https://api.githubcopilot.com",
-            token="tok",
-        )
-        assert client._ghes_host() is None
-
-
-class TestGHESTokenResolution:
+class TestTokenResolution:
     @patch.dict(os.environ, {"GITHUB_TOKEN": "env-token"})
-    def test_env_token_takes_priority_over_ghes(self):
-        client = CopilotClient(
-            model_name="test",
-            endpoint="https://github.mycompany.com",
-        )
+    def test_env_token_takes_priority(self):
+        client = CopilotClient(model_name="test")
         assert client.token == "env-token"
 
     @patch.dict(os.environ, {"COPILOT_TOKEN": "copilot-env"})
     def test_copilot_token_takes_priority(self):
-        client = CopilotClient(
-            model_name="test",
-            endpoint="https://github.mycompany.com",
-        )
+        client = CopilotClient(model_name="test")
         assert client.token == "copilot-env"
 
 
-class TestGHESEndpointStored:
-    def test_custom_endpoint_stored(self):
-        client = CopilotClient(
-            model_name="test",
-            endpoint="https://github.mycompany.com",
-            token="tok",
-        )
-        assert client.endpoint == "https://github.mycompany.com"
+# ── Client basics ─────────────────────────────────────────────────────────────
 
-    def test_endpoint_stripped_of_trailing_slash(self):
-        client = CopilotClient(
-            model_name="test",
-            endpoint="https://github.mycompany.com/",
-            token="tok",
-        )
-        assert client.endpoint == "https://github.mycompany.com"
+
+class TestClientBasics:
+    def test_default_endpoint_is_class_constant(self):
+        assert CopilotClient.DEFAULT_ENDPOINT == "https://api.githubcopilot.com"
+
+    def test_repr_masks_token(self):
+        client = CopilotClient(model_name="test", token="secret123")
+        r = repr(client)
+        assert "model='test'" in r
+        assert "token=***" in r
+        # Token value must never leak into the repr.
+        assert "secret123" not in r
 
 
 # ── Credit budget ─────────────────────────────────────────────────────────────
@@ -95,7 +53,8 @@ class TestGHESEndpointStored:
 
 class TestCreditBudget:
     def test_check_budget_raises_when_exceeded(self):
-        from agent_orchestrator import AgentOrchestrator, OrchestratorError
+        from agent_orchestrator import AgentOrchestrator
+        from copilot_client import BudgetExhaustedError
         from pathlib import Path
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -107,7 +66,7 @@ class TestCreditBudget:
                 force=True,
             )
             orch._credits_used = 2
-            with pytest.raises(OrchestratorError, match="Credit budget exhausted"):
+            with pytest.raises(BudgetExhaustedError, match="Credit budget exhausted"):
                 orch._check_budget()
 
     def test_check_budget_passes_when_under(self):

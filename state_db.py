@@ -38,7 +38,9 @@ class _FileLock:
         try:
             fcntl.flock(self._fd, fcntl.LOCK_EX)
         except OSError as e:
-            logger.warning("Could not acquire state DB lock: %s", e)
+            raise StateCorruptionError(
+                f"Could not acquire state DB lock: {e}"
+            ) from e
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if sys.platform == "win32":
@@ -131,6 +133,7 @@ class StateDB:
             prefix=".actions_audit_state.", suffix=".json.tmp",
             dir=str(self.path.parent),
         )
+        os.chmod(tmp_path, 0o644)
         try:
             with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, indent=2, sort_keys=True)
@@ -185,8 +188,8 @@ class StateDB:
         if self._fd is not None:
             try:
                 os.close(self._fd)
-            except OSError:
-                pass
+            except OSError as e:
+                logger.warning("Error closing state DB file descriptor: %s", e)
             self._fd = None
 
     def __enter__(self) -> "StateDB":
@@ -206,7 +209,8 @@ class StateDB:
             return False
         if entry.get("status") != "completed":
             return False
-        if entry.get("last_mtime") != mtime:
+        stored_mtime = entry.get("last_mtime")
+        if stored_mtime is None or abs(stored_mtime - mtime) > 0.001:
             return False
         if entry.get("content_sha256") != content_sha256:
             return False
@@ -224,11 +228,6 @@ class StateDB:
             "last_mtime": mtime,
             "content_sha256": content_sha256,
         }
-
-    def get_resume_payload(self, rel_path: str) -> dict[str, Any] | None:
-        """Return the violations + AST for an entry that should be skipped."""
-        return self.get(rel_path)
-
 
 def compute_file_sha256(path: Path) -> str:
     h = hashlib.sha256()

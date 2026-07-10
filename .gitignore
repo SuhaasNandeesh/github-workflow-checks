@@ -5,6 +5,7 @@ __pycache__/
 
 # Caches and local states
 .actions_audit_state.json
+.actions_audit/
 
 # OS generated files
 .DS_Store

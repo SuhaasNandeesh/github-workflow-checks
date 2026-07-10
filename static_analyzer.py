@@ -25,25 +25,67 @@ _PERMISSION_WIDENING: dict[tuple[str, str], bool] = {
 # "write" at workflow level means job can't widen further (it's already max),
 # and "read" at both levels is not widening.
 
+# First-party action org prefixes — considered trusted for the
+# token-passed-to-third-party rule. Editable via rules_config["trusted_action_orgs"].
+_DEFAULT_TRUSTED_ORGS = (
+    "actions/", "github/", "azure/", "aws-actions/", "google-github-actions/",
+)
+
+# Run-line regexes for credential literals (secret-in-run-literal). Tunable.
+_SECRET_LITERAL_PATTERNS = [
+    # AWS access key id (long) + secret (40 base64 after AWS secret prefix is not unique;
+    # we look for the documented AKIA... access key id and typical secret assignments).
+    re.compile(r'\bAKIA[0-9A-Z]{16}\b'),
+    # Generic password/secret/key assignments with a non-placeholder value.
+    re.compile(r'(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|token)\b\s*[=:]\s*["\']?[^\s"\']{8,}'),
+    # -----BEGIN PRIVATE KEY-----
+    re.compile(r'-----BEGIN (?:RSA |EC |DSA |OPENSSH |)PRIVATE KEY-----'),
+]
+
+# Expression interpolation directly in run: scripts (expression-in-run-injection).
+_RUNEXPR_RE = re.compile(r'\$\{\{\s*[^}]*\s*\}\}')
+
 
 class StaticAnalyzer:
-    def __init__(self, rules_config=None, token: str | None = None, endpoint: str | None = None):
+    def __init__(self, rules_config=None, token: str | None = None,
+                 endpoint: str | None = None, api_endpoint: str | None = None,
+                 sha_cache_path: str | None = None):
         self.rules_config = rules_config or {}
         self.token = token or os.environ.get("GITHUB_TOKEN") or os.environ.get("COPILOT_TOKEN")
-        self.endpoint = (endpoint or "https://api.github.com").rstrip("/")
+        # GitHub API endpoint for action SHA resolution. Defaults: GHES endpoint
+        # if provided, else api.github.com.
+        cfg_endpoint = self.rules_config.get("endpoint") if isinstance(self.rules_config, dict) else None
+        cfg_api = self.rules_config.get("api_endpoint") if isinstance(self.rules_config, dict) else None
+        self.endpoint = (
+            api_endpoint or cfg_api or endpoint or cfg_endpoint or "https://api.github.com"
+        ).rstrip("/")
         # Regex to match 40-character hex SHA
         self.sha_pattern = re.compile(r'^[a-fA-F0-9]{40}$')
-        # Regex to match GitLab variables e.g., $CI_PROJECT_NAME, ${CI_COMMIT_SHA}
-        self.gitlab_var_pattern = re.compile(r'\$CI_[A-Za-z0-9_]+|\$\{CI_[A-Za-z0-9_]+\}')
         # Default secret pattern; overridable via rules_config["secret_keyword_pattern"].
+        # No leading \b so that prefixed names like PROD_API_KEY still match the
+        # API_KEY alternation; a trailing \b avoids matching KEYWORD/KEYBOARD.
         self.secret_keyword_pattern = re.compile(
             self.rules_config.get(
                 "secret_keyword_pattern",
-                r'(?i)(KEY|TOKEN|PASS|PASSWORD|SECRET|API[_-]?KEY|PAT|CRED|PRIVATE[_-]?KEY|CLIENT[_-]?SECRET)',
-            )
+                r'(?:KEY|TOKEN|PASS|PASSWORD|SECRET|API[_-]?KEY|PAT|CRED|PRIVATE[_-]?KEY|CLIENT[_-]?SECRET)\b',
+            ),
+            re.IGNORECASE,
         )
-        # Cache for resolved action SHAs: action@tag -> sha (or None on miss)
+        # Trusted org prefixes for token-passed-to-third-party.
+        self.trusted_orgs = tuple(
+            self.rules_config.get("trusted_action_orgs", _DEFAULT_TRUSTED_ORGS)
+        )
+        # Offline action-SHA cache: action@tag -> sha (or None on confirmed miss).
         self._sha_cache: dict[str, str | None] = {}
+        self._sha_cache_dirty = False
+        self._sha_cache_path = (
+            sha_cache_path
+            or (self.rules_config.get("sha_cache_path") if isinstance(self.rules_config, dict) else None)
+            or "actions-sha-cache.json"
+        )
+        self._load_sha_cache()
+        # Workflow scope cache per analyze_workflow call.
+        self._scope: set[str] = set()
 
     def analyze_workflow(self, filepath, raw_data):
         """Runs offline static validation rules on raw parsed workflow dict."""
@@ -51,6 +93,10 @@ class StaticAnalyzer:
 
         if not raw_data:
             return findings
+
+        self._workflow_env = raw_data.get("env", {}) if isinstance(raw_data.get("env"), dict) else {}
+        # Determine workflow scope (source / image / deploy / all) for applies_to gating.
+        self._scope = self._classify_workflow_scope(raw_data)
 
         # Run global checks
         findings.extend(self._check_dependency_cycles(raw_data))
@@ -67,6 +113,7 @@ class StaticAnalyzer:
                 findings.extend(self._check_job_artifacts_transfer(job_id, job_data, jobs))
                 findings.extend(self._check_runner_shell_misalignment(job_id, job_data))
                 findings.extend(self._check_job_permissions_escalation(job_id, job_data, raw_data))
+                findings.extend(self._check_runner_version_pinned(job_id, job_data))
                 findings.extend(self._check_job_timeout(job_id, job_data))
                 findings.extend(self._check_reusable_workflow_job(job_id, job_data))
 
@@ -81,16 +128,26 @@ class StaticAnalyzer:
                         findings.extend(self._check_multiline_block_scalar(job_id, idx, step))
                         findings.extend(self._check_enterprise_security_gates(job_id, idx, step))
                         findings.extend(self._check_checkout_persist_credentials(job_id, idx, step))
-                        findings.extend(self._check_checkout_fetch_depth(job_id, idx, step))
                         findings.extend(self._check_step_timeout(job_id, idx, step))
                         findings.extend(self._check_latest_runtime_version(job_id, idx, step))
                         findings.extend(self._check_deprecated_set_output(job_id, idx, step))
                         findings.extend(self._check_untrusted_input_injection(job_id, idx, step))
                         findings.extend(self._check_submodule_recursive(job_id, idx, step))
-                        findings.extend(self._check_reusable_workflow_pinned(job_id, idx, step))
+                        findings.extend(self._check_secret_in_run_literal(job_id, idx, step))
+                        findings.extend(self._check_secret_echoed_in_logs(job_id, idx, step))
+                        findings.extend(self._check_expression_in_run_injection(job_id, idx, step))
+                        findings.extend(self._check_missing_set_x_pipefail(job_id, idx, step))
+
+                findings.extend(self._check_always_deploy_after_failure(job_id, job_data, jobs))
+                findings.extend(self._check_environment_protection(job_id, job_data))
+                findings.extend(self._check_matrix_fail_fast(job_id, job_data))
 
         # Check global workflow-level security gates
         findings.extend(self._check_global_security_gates(raw_data))
+        findings.extend(self._check_pull_request_target_danger(raw_data))
+        findings.extend(self._check_self_hosted_runner(raw_data))
+        findings.extend(self._check_docker_action_digest_pin(raw_data))
+        findings.extend(self._check_token_passed_to_third_party(raw_data))
 
         return findings
 
@@ -103,7 +160,8 @@ class StaticAnalyzer:
         if uses_val.startswith("./") or uses_val.startswith("../"):
             return []
 
-        # Docker/Docker Hub actions e.g. docker://alpine, skip them
+        # Docker/Docker Hub actions e.g. docker://alpine are handled by the
+        # docker-action-digest-pin rule instead.
         if uses_val.startswith("docker://"):
             return []
 
@@ -128,6 +186,106 @@ class StaticAnalyzer:
             }]
 
         return []
+
+    def _rule_applies(self, rule_id: str) -> bool:
+        """Check a rule's applies_to against the current workflow scope (Phase 5)."""
+        rule_info = self.rules_config.get("rules", {}).get(rule_id) if isinstance(self.rules_config, dict) else None
+        if not isinstance(rule_info, dict):
+            return True
+        applies = rule_info.get("applies_to", ["all"])
+        if not isinstance(applies, list) or not applies:
+            return True
+        if "all" in applies:
+            return True
+        return any(s in applies for s in self._scope)
+
+    def _classify_workflow_scope(self, raw_data) -> set[str]:
+        """Classify a workflow as source / image / deploy based on its contents."""
+        scopes: set[str] = {"all"}
+        jobs = raw_data.get("jobs", {})
+        all_steps = []
+        if isinstance(jobs, dict):
+            for job_data in jobs.values():
+                if isinstance(job_data, dict):
+                    steps = job_data.get("steps", [])
+                    if isinstance(steps, list):
+                        all_steps.extend(s for s in steps if isinstance(s, dict))
+
+        uses_list = [s.get("uses", "") for s in all_steps if isinstance(s.get("uses"), str)]
+        run_scripts = _strip_noise(" ".join(
+            str(s.get("run", "")) for s in all_steps if s.get("run")
+        ))
+
+        is_image = (
+            "docker build" in run_scripts
+            or "docker push" in run_scripts
+            or "docker buildx" in run_scripts
+            or "kaniko" in run_scripts
+            or "buildah" in run_scripts
+            or any("docker" in u.lower() for u in uses_list if isinstance(u, str))
+            or "jf docker push" in run_scripts
+            or "jf rt docker-push" in run_scripts
+        )
+        if is_image:
+            scopes.add("image")
+
+        # Source-bearing workflows: have a checkout, build tooling, or test runner.
+        has_source = (
+            any("actions/checkout" in u for u in uses_list)
+            or "npm ci" in run_scripts or "npm run build" in run_scripts
+            or "mvn " in run_scripts or "gradle" in run_scripts
+            or "dotnet build" in run_scripts or "dotnet test" in run_scripts
+            or "go build" in run_scripts or "go test" in run_scripts
+            or "pip install" in run_scripts or "pytest" in run_scripts
+            or "make" in run_scripts
+        )
+        if has_source:
+            scopes.add("source")
+
+        # Deploy workflows: name/trigger/keyword heuristics.
+        name = (raw_data.get("name") or "").lower()
+        triggers = raw_data.get("on")
+        trigger_names: list[str] = []
+        if isinstance(triggers, dict):
+            trigger_names = [k.lower() for k in triggers.keys()]
+        elif isinstance(triggers, str):
+            trigger_names = [triggers.lower()]
+        elif isinstance(triggers, list):
+            trigger_names = [t.lower() for t in triggers if isinstance(t, str)]
+        is_deploy = (
+            "deploy" in name or "publish" in name or "release" in name
+            or any(t in ("deployment", "release", "publish") for t in trigger_names)
+            or "deploy" in run_scripts or "kubectl apply" in run_scripts
+            or "helm upgrade" in run_scripts or "terraform apply" in run_scripts
+        )
+        if is_deploy:
+            scopes.add("deploy")
+
+        return scopes
+
+    def _load_sha_cache(self) -> None:
+        try:
+            with open(self._sha_cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._sha_cache = {k: v for k, v in data.items() if v is None or (isinstance(v, str) and self.sha_pattern.match(v))}
+        except (OSError, json.JSONDecodeError):
+            self._sha_cache = {}
+
+    def persist_sha_cache(self) -> None:
+        """Flush the in-memory SHA cache to disk so it can be reused offline."""
+        if not self._sha_cache_dirty:
+            return
+        try:
+            tmp = self._sha_cache_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._sha_cache, f, indent=2, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._sha_cache_path)
+            self._sha_cache_dirty = False
+        except OSError as e:
+            logger.debug("Could not persist SHA cache to %s: %s", self._sha_cache_path, e)
 
     def _check_residual_gitlab_vars(self, job_id, step_idx, step):
         findings = []
@@ -173,6 +331,9 @@ class StaticAnalyzer:
         job_env = job_data.get("env")
         if isinstance(job_env, dict):
             bound_env.update(job_env.keys())
+
+        if isinstance(getattr(self, '_workflow_env', None), dict):
+            bound_env.update(self._workflow_env)
 
         # GITHUB_TOKEN is auto-injected by the runner; only flag if a job-level
         # permission scope has not been verified (A7). The job-level permission
@@ -271,6 +432,23 @@ class StaticAnalyzer:
 
         return findings
 
+    def _check_runner_version_pinned(self, job_id, job_data):
+        """Flag runs-on using 'latest' instead of a pinned version."""
+        runs_on = job_data.get("runs-on", "")
+        runner_str = ""
+        if isinstance(runs_on, str):
+            runner_str = runs_on.lower()
+        elif isinstance(runs_on, list):
+            runner_str = " ".join(str(t).lower() for t in runs_on if isinstance(t, str))
+        if "latest" in runner_str:
+            return [{
+                "rule": "runner-version-pinned",
+                "location": f"jobs.{job_id}",
+                "message": f"Job '{job_id}' uses 'runs-on: latest' which is non-reproducible. Pin to a specific version.",
+                "original": str(runs_on),
+            }]
+        return []
+
     def _check_multiline_block_scalar(self, job_id, step_idx, step):
         run_val = step.get("run")
         if not run_val or not isinstance(run_val, str) or '\n' not in run_val:
@@ -351,7 +529,19 @@ class StaticAnalyzer:
     def _check_concurrency_control(self, raw_data):
         # Deployment or publication workflows should define concurrency
         name = raw_data.get("name", "").lower()
-        is_deploy = "deploy" in name or "publish" in name or "release" in name
+        triggers = raw_data.get("on") or raw_data.get(True) or {}
+        trigger_names = []
+        if isinstance(triggers, dict):
+            trigger_names = [k.lower() for k in triggers.keys()]
+        elif isinstance(triggers, str):
+            trigger_names = [triggers.lower()]
+        elif isinstance(triggers, list):
+            trigger_names = [t.lower() for t in triggers if isinstance(t, str)]
+        
+        is_deploy = (
+            "deploy" in name or "publish" in name or "release" in name
+            or any(t in ("deployment", "release", "publish") for t in trigger_names)
+        )
         
         concurrency = raw_data.get("concurrency")
         if is_deploy and not concurrency:
@@ -364,10 +554,18 @@ class StaticAnalyzer:
         return []
 
     def _check_job_artifacts_transfer(self, job_id, job_data, all_jobs):
+        """Flag downstream jobs that need an artifact-producing job but neither
+        download it nor reference its outputs (Phase 5 tightening).
+
+        Prior implementation fired whenever ``needs`` was set and the upstream
+        uploaded artifacts, producing false positives when ``needs`` was used
+        only for ordering/gating. Now we require the downstream job to reference
+        an artifact path or an upstream ``outputs.*`` to report.
+        """
         needs = job_data.get("needs", [])
         if isinstance(needs, str):
             needs = [needs]
-        
+
         if not needs:
             return []
 
@@ -376,33 +574,36 @@ class StaticAnalyzer:
         if not isinstance(steps, list):
             return []
 
-        # See if there are references to directories or outputs from other jobs in shell command
-        run_cmds = " ".join([step.get("run", "") for step in steps if isinstance(step, dict) and "run" in step])
-        
-        # Check if step downloads artifacts
+        run_cmds = _strip_noise(" ".join(
+            str(s.get("run", "")) for s in steps if isinstance(s, dict) and "run" in s
+        ))
         has_download = any(
-            isinstance(step, dict) and "uses" in step and "actions/download-artifact" in step["uses"]
-            for step in steps
+            isinstance(s, dict) and "uses" in s and "actions/download-artifact" in s["uses"]
+            for s in steps
         )
+        # Reference to upstream job outputs, e.g. needs.<job>.outputs.<name>
+        uses_upstream_outputs = bool(re.search(
+            r'needs\.[A-Za-z0-9_\-]+\.outputs\.', run_cmds
+        ))
+        # Reference to an artifact name (heuristic: words artifact/file in run cmds).
+        refs_artifact = "ARTIFACT" in run_cmds or "artifacts/" in run_cmds or "download-artifact" in run_cmds
 
         for needed_job in needs:
             needed_job_data = all_jobs.get(needed_job)
             if not isinstance(needed_job_data, dict):
                 continue
-            
-            # Check if needed job generates artifacts (indicated by actions/upload-artifact usage)
+
             needed_steps = needed_job_data.get("steps", [])
             has_upload = any(
-                isinstance(step, dict) and "uses" in step and "actions/upload-artifact" in step["uses"]
-                for step in needed_steps if isinstance(needed_steps, list)
+                isinstance(s, dict) and "uses" in s and "actions/upload-artifact" in s["uses"]
+                for s in needed_steps if isinstance(needed_steps, list)
             )
 
-            # If job B needs job A, and Job A generates an artifact but Job B doesn't download it, flag warning
-            if has_upload and not has_download:
+            if has_upload and not has_download and not uses_upstream_outputs and not refs_artifact:
                 findings.append({
                     "rule": "explicit-artifact-transfer",
                     "location": f"jobs.{job_id}",
-                    "message": f"Job depends on '{needed_job}' which uploads artifacts, but this job does not invoke 'actions/download-artifact'.",
+                    "message": f"Job depends on '{needed_job}' which uploads artifacts, but this job does not invoke 'actions/download-artifact' or reference needs.{needed_job}.outputs.",
                     "original": f"needs: {needed_job}"
                 })
         return findings
@@ -482,7 +683,9 @@ class StaticAnalyzer:
         return findings
 
     def _check_global_security_gates(self, raw_data):
-        # Scans the entire file to verify presence of critical security tasks
+        # Scans the entire file to verify presence of critical security tasks.
+        # Gating now respects per-rule ``applies_to`` (Phase 5): coverity applies
+        # to source+image, while bdba/signing/jfrog apply to image only.
         jobs = raw_data.get("jobs", {})
         if not isinstance(jobs, dict):
             return []
@@ -495,10 +698,42 @@ class StaticAnalyzer:
                     all_steps.extend(steps)
 
         findings = []
-        
-        # Join step uses and scripts to simplify pattern scanning
+
+        # Join step uses and scripts to simplify pattern scanning.
+        # Use _strip_noise so comment lines and echoed strings don't match.
         uses_list = [s.get("uses", "") for s in all_steps if isinstance(s, dict)]
-        run_scripts = " ".join([s.get("run", "") for s in all_steps if isinstance(s, dict) and "run" in s])
+        run_scripts = _strip_noise(" ".join(
+            str(s.get("run", "")) for s in all_steps
+            if isinstance(s, dict) and s.get("run")
+        ))
+
+        has_jfrog_push = (
+            any("setup-cli" in u for u in uses_list)
+            or "jf docker push" in run_scripts
+            or "jf rt docker-push" in run_scripts
+            or "docker push" in run_scripts
+        )
+
+        # Image workflows: build/push docker (incl. buildx/kaniko), or docker actions.
+        is_image_workflow = (
+            has_jfrog_push
+            or "docker build" in run_scripts
+            or "docker push" in run_scripts
+            or "docker buildx" in run_scripts
+            or "kaniko" in run_scripts
+            or "buildah" in run_scripts
+            or any("docker" in u.lower() for u in uses_list if isinstance(u, str))
+        )
+        # Source-bearing workflows.
+        is_source_workflow = (
+            any("actions/checkout" in u for u in uses_list)
+            or "npm ci" in run_scripts or "npm run build" in run_scripts
+            or "mvn " in run_scripts or "gradle" in run_scripts
+            or "dotnet build" in run_scripts or "dotnet test" in run_scripts
+            or "go build" in run_scripts or "go test" in run_scripts
+            or "pip install" in run_scripts or "pytest" in run_scripts
+            or "make" in run_scripts
+        )
 
         has_coverity = any(
             "black-duck-security-scan" in u or "synopsys-action" in u
@@ -510,53 +745,54 @@ class StaticAnalyzer:
             for u in uses_list
         ) or "synopsys-detect" in run_scripts
 
-        has_jfrog_push = any(
-            "setup-cli" in u for u in uses_list
-        ) or "jf docker push" in run_scripts or "jf rt docker-push" in run_scripts or "docker push" in run_scripts
-
         has_cosign = any(
             "cosign-installer" in u for u in uses_list
         ) or "cosign sign" in run_scripts
 
-        if not has_coverity:
-            findings.append({
-                "rule": "coverity-scan",
-                "location": "workflow",
-                "message": "Coverity scan (SAST / secrets checking) is not configured in this workflow.",
-                "original": "missing"
-            })
-            
-        if not has_jfrog_push:
-            findings.append({
-                "rule": "image-build-jfrog",
-                "location": "workflow",
-                "message": "Docker image building and push to JFrog Artifactory registry is not configured.",
-                "original": "missing"
-            })
+        def _gate(rule_id: str, message: str, cond: bool, missing_cond: bool):
+            if not self._rule_applies(rule_id):
+                return
+            if cond and missing_cond:
+                findings.append({
+                    "rule": rule_id,
+                    "location": "workflow",
+                    "message": message,
+                    "original": "missing",
+                })
 
-        if has_jfrog_push and not has_cosign:
-            findings.append({
-                "rule": "image-signing",
-                "location": "workflow",
-                "message": "Artifacts pushed to JFrog are not signed using Cosign.",
-                "original": "missing"
-            })
-
-        if has_jfrog_push and not has_bdba:
-            findings.append({
-                "rule": "bdba-scan",
-                "location": "workflow",
-                "message": "BDBA (Black Duck Binary Analysis) vulnerability scan is not configured on built images.",
-                "original": "missing"
-            })
+        _gate(
+            "coverity-scan",
+            "Coverity scan (SAST / secrets checking) is not configured in this workflow.",
+            is_source_workflow or is_image_workflow,
+            not has_coverity,
+        )
+        _gate(
+            "image-build-jfrog",
+            "Docker image building and push to JFrog Artifactory registry is not configured.",
+            is_image_workflow,
+            not has_jfrog_push,
+        )
+        _gate(
+            "image-signing",
+            "Artifacts pushed to JFrog are not signed using Cosign.",
+            has_jfrog_push,
+            not has_cosign,
+        )
+        _gate(
+            "bdba-scan",
+            "BDBA (Black Duck Binary Analysis) vulnerability scan is not configured on built images.",
+            has_jfrog_push,
+            not has_bdba,
+        )
 
         return findings
 
     def fetch_latest_sha(self, action_name, tag):
         """Resolve an action's tag/branch to its immutable commit SHA.
 
-        Subpath actions (e.g. `org/repo/sub/dir@v1`) are rejected — they
-        cannot be safely resolved by the public git-refs API (A9).
+        Uses a persistent offline cache (``sha_cache_path``) so fix mode works
+        air-gapped. Subpath actions (e.g. ``org/repo/sub/dir@v1``) are rejected —
+        they cannot be safely resolved by the public git-refs API (A9).
         """
         parts = action_name.split('/')
         if len(parts) < 2:
@@ -576,6 +812,7 @@ class StaticAnalyzer:
 
         sha = self._fetch_tag_sha(owner, repo, tag)
         self._sha_cache[cache_key] = sha
+        self._sha_cache_dirty = True
         return sha
 
     def _fetch_tag_sha(self, owner: str, repo: str, tag: str) -> str | None:
@@ -673,7 +910,9 @@ class StaticAnalyzer:
         return findings
 
     def _check_job_timeout(self, job_id, job_data):
-        """Flag jobs without timeout-minutes."""
+        """Flag jobs without timeout-minutes (skip reusable workflow calls)."""
+        if job_data.get("uses"):
+            return []
         if "timeout-minutes" not in job_data:
             return [{
                 "rule": "job-timeout-missing",
@@ -728,26 +967,6 @@ class StaticAnalyzer:
             }]
         return []
 
-    def _check_checkout_fetch_depth(self, job_id, idx, step):
-        """Flag actions/checkout with fetch-depth: 0 when not explicitly needed."""
-        uses_val = step.get("uses", "")
-        if not uses_val or not isinstance(uses_val, str):
-            return []
-        if "actions/checkout" not in uses_val:
-            return []
-        with_block = step.get("with") or {}
-        if not isinstance(with_block, dict):
-            with_block = {}
-        depth = with_block.get("fetch-depth")
-        if depth == 0:
-            return [{
-                "rule": "checkout-fetch-depth",
-                "location": f"jobs.{job_id}.steps[{idx}]",
-                "message": "actions/checkout uses fetch-depth: 0 (full history clone). Ensure this is intentional.",
-                "original": str(uses_val),
-            }]
-        return []
-
     def _check_step_timeout(self, job_id, idx, step):
         """Flag long run: steps without timeout-minutes."""
         if "run" not in step:
@@ -770,12 +989,7 @@ class StaticAnalyzer:
         uses_val = step.get("uses", "")
         if not uses_val or not isinstance(uses_val, str):
             return []
-        setup_actions = (
-            "actions/setup-python", "actions/setup-node", "actions/setup-go",
-            "actions/setup-java", "actions/setup-ruby", "actions/setup-dotnet",
-        )
-        is_setup = any(f"actions/setup-" in u for u in [uses_val])
-        if not is_setup:
+        if "actions/setup-" not in uses_val:
             return []
         with_block = step.get("with") or {}
         if not isinstance(with_block, dict):
@@ -783,7 +997,7 @@ class StaticAnalyzer:
         for key, val in with_block.items():
             if not key.endswith("-version") or not isinstance(val, str):
                 continue
-            if val.lower() in ("latest", "lts", "lts/*", "lts/*", "stable"):
+            if val.lower() in ("latest", "lts", "lts/*", "stable"):
                 return [{
                     "rule": "latest-runtime-version",
                     "location": f"jobs.{job_id}.steps[{idx}]",
@@ -850,36 +1064,10 @@ class StaticAnalyzer:
             }]
         return []
 
-    def _check_reusable_workflow_pinned(self, job_id, idx, step):
-        """Flag reusable workflow calls (uses: org/repo/.github/workflows/...@ref) where ref is not a SHA."""
-        uses_val = step.get("uses", "")
-        if not uses_val or not isinstance(uses_val, str):
-            return []
-        # Reusable workflow syntax: org/repo/.github/workflows/file.yml@ref
-        if "/.github/workflows/" not in uses_val:
-            return []
-        if "@" not in uses_val:
-            return [{
-                "rule": "reusable-workflow-pinned",
-                "location": f"jobs.{job_id}.steps[{idx}]",
-                "message": f"Reusable workflow '{uses_val}' has no version reference. Pin to a commit SHA.",
-                "original": uses_val,
-            }]
-        parts = uses_val.split("@")
-        ref = parts[1] if len(parts) > 1 else ""
-        if not self.sha_pattern.match(ref):
-            return [{
-                "rule": "reusable-workflow-pinned",
-                "location": f"jobs.{job_id}.steps[{idx}]",
-                "message": f"Reusable workflow '{uses_val.split('@')[0]}' is pinned to tag/branch '{ref}' instead of an immutable SHA.",
-                "original": uses_val,
-            }]
-        return []
-
     def _check_oidc_cloud_deploy(self, raw_data):
         """Flag cloud-deploy actions without permissions: id-token: write."""
         OIDC_ACTIONS = ("aws-actions/configure-aws-credentials", "azure/login", "google-github-actions/auth")
-        OIDC_SCRIPTS = ("aws-actions/configure-aws-credentials", "azure/login", "google-github-actions/auth")
+        OIDC_SCRIPTS = ("aws sts get-caller-identity", "aws configure set", "az login", "gcloud auth")
 
         jobs = raw_data.get("jobs", {})
         if not isinstance(jobs, dict):
@@ -906,10 +1094,10 @@ class StaticAnalyzer:
             if not has_oidc:
                 continue
             job_perms = job_data.get("permissions")
-            if isinstance(job_perms, dict) and job_perms.get("id-token") in ("write", "read"):
+            if isinstance(job_perms, dict) and job_perms.get("id-token") == "write":
                 continue
             workflow_perms = raw_data.get("permissions")
-            if isinstance(workflow_perms, dict) and workflow_perms.get("id-token") in ("write", "read"):
+            if isinstance(workflow_perms, dict) and workflow_perms.get("id-token") == "write":
                 continue
             findings.append({
                 "rule": "oidc-cloud-deploy",
@@ -921,3 +1109,394 @@ class StaticAnalyzer:
                 "original": "missing",
             })
         return findings
+
+    # ─── PR 5: New production-grade rules (July 2026) ────────────────────
+
+    def _check_pull_request_target_danger(self, raw_data):
+        """Flag pull_request_target triggers combined with PR-head checkout.
+
+        ``pull_request_target`` runs with the base branch's secrets. If the
+        workflow also checks out ``github.event.pull_request.head.ref`` (or the
+        PR SHA) and runs untrusted build/test code, that code executes with
+        write access — a critical supply-chain vulnerability (tj-actions /
+        reviewdog historical incidents). We flag the combination.
+        """
+        triggers = raw_data.get("on")
+        trigger_names: list[str] = []
+        if isinstance(triggers, dict):
+            trigger_names = [k.lower() for k in triggers.keys()]
+        elif isinstance(triggers, str):
+            trigger_names = [triggers.lower()]
+        elif isinstance(triggers, list):
+            trigger_names = [t.lower() for t in triggers if isinstance(t, str)]
+        if "pull_request_target" not in trigger_names:
+            return []
+
+        jobs = raw_data.get("jobs", {})
+        if not isinstance(jobs, dict):
+            return []
+        findings = []
+        for job_id, job_data in jobs.items():
+            if not isinstance(job_data, dict):
+                continue
+            steps = job_data.get("steps", [])
+            if not isinstance(steps, list):
+                continue
+            for idx, step in enumerate(steps):
+                if not isinstance(step, dict):
+                    continue
+                uses_val = str(step.get("uses", ""))
+                with_block = step.get("with") if isinstance(step.get("with"), dict) else {}
+                ref = str(with_block.get("ref", ""))
+                # If checkout references the PR head ref or SHA under prt → danger.
+                if "actions/checkout" in uses_val and (
+                    "head.ref" in ref
+                    or "pull_request.head.sha" in ref
+                    or ref.startswith("refs/pull/")
+                ):
+                    findings.append({
+                        "rule": "pull-request-target-danger",
+                        "location": f"jobs.{job_id}.steps[{idx}]",
+                        "message": (
+                            "Workflow uses pull_request_target and checks out PR head code; "
+                            "this executes untrusted code with base-branch secrets. Avoid "
+                            "checking out PR refs under pull_request_target, or run only "
+                            "trusted label/comment actions."
+                        ),
+                        "original": uses_val,
+                    })
+                    break
+                # Also flag run: scripts that build PR code under prt.
+                run_cmd = str(step.get("run", ""))
+                if run_cmd and (
+                    "${{ github.event.pull_request.head.sha }}" in run_cmd
+                    or "github.event.pull_request.head.ref" in run_cmd
+                ):
+                    findings.append({
+                        "rule": "pull-request-target-danger",
+                        "location": f"jobs.{job_id}.steps[{idx}]",
+                        "message": (
+                            "Workflow uses pull_request_target and a run step references the "
+                            "PR head; untrusted code runs with base-branch secrets."
+                        ),
+                        "original": run_cmd[:200],
+                    })
+                    break
+        return findings
+
+    def _check_self_hosted_runner(self, raw_data):
+        """Flag runs-on: self-hosted (broad label) — supply-chain RCE on public repos."""
+        jobs = raw_data.get("jobs", {})
+        if not isinstance(jobs, dict):
+            return []
+        findings = []
+        for job_id, job_data in jobs.items():
+            if not isinstance(job_data, dict):
+                continue
+            runs_on = job_data.get("runs-on")
+            runner_str = ""
+            if isinstance(runs_on, str):
+                runner_str = runs_on.lower()
+            elif isinstance(runs_on, list):
+                runner_str = " ".join(str(t).lower() for t in runs_on if isinstance(t, str))
+            # Bare "self-hosted" with no further org/runner-group label is risky.
+            tokens = [t for t in re.split(r"[\s,]+", runner_str) if t]
+            if tokens == ["self-hosted"] or "self-hosted" in tokens and len(tokens) == 1:
+                findings.append({
+                    "rule": "self-hosted-runner-public-repo",
+                    "location": f"jobs.{job_id}",
+                    "message": (
+                        "Job uses 'runs-on: self-hosted' with no runner-group/org label. "
+                        "On a public repository this exposes the runner to untrusted code "
+                        "execution. Use GitHub-hosted runners or label-gated self-hosted "
+                        "runners only on private repos."
+                    ),
+                    "original": str(runs_on),
+                })
+        return findings
+
+    def _check_secret_in_run_literal(self, job_id, idx, step):
+        """Flag hardcoded credentials embedded in run: scripts."""
+        run_val = step.get("run")
+        if not run_val or not isinstance(run_val, str):
+            return []
+        noiseless = _strip_noise(run_val)
+        for pattern in _SECRET_LITERAL_PATTERNS:
+            if pattern.search(noiseless):
+                return [{
+                    "rule": "secret-in-run-literal",
+                    "location": f"jobs.{job_id}.steps[{idx}]",
+                    "message": "Hardcoded credential literal detected in run: script. Bind credentials via env: referencing secrets.<NAME> instead.",
+                    "original": run_val[:200],
+                }]
+        return []
+
+    def _check_secret_echoed_in_logs(self, job_id, idx, step):
+        """Flag ${{ secrets.* }} interpolated directly into run: (echoed in logs)."""
+        run_val = step.get("run")
+        if not run_val or not isinstance(run_val, str):
+            return []
+        if re.search(r"\$\{\{\s*secrets\.", run_val) and "env:" not in step:
+            return [{
+                "rule": "secret-echoed-in-logs",
+                "location": f"jobs.{job_id}.steps[{idx}]",
+                "message": "Secret referenced via ${{ secrets.* }} directly in run: is echoed in workflow logs. Bind it through env: instead.",
+                "original": run_val[:200],
+            }]
+        return []
+
+    def _check_expression_in_run_injection(self, job_id, idx, step):
+        """Flag untrusted ${{ github.event.* }} expressions in run: scripts."""
+        run_val = step.get("run")
+        if not run_val or not isinstance(run_val, str):
+            return []
+        # Find expression interpolations in the run script.
+        exprs = _RUNEXPR_RE.findall(run_val)
+        if not exprs:
+            return []
+        # Untrusted contexts that should never be interpolated directly in run:.
+        untrusted_pattern = re.compile(
+            r"\$\{\{\s*(github\.(event\.(issue|pull_request|comment|discussion|"
+            r"head_ref|base_ref|ref|ref_name|sha|actor|workflow_trigger)|"
+            r"github\.head_ref|github\.base_ref))",
+            re.IGNORECASE,
+        )
+        for expr in exprs:
+            if untrusted_pattern.search(expr):
+                return [{
+                    "rule": "expression-in-run-injection",
+                    "location": f"jobs.{job_id}.steps[{idx}]",
+                    "message": (
+                        f"Untrusted expression '{expr.strip()[:80]}' interpolated directly "
+                        "into run: enables script injection. Assign to an env: var first."
+                    ),
+                    "original": run_val[:200],
+                }]
+        return []
+
+    def _check_environment_protection(self, job_id, job_data):
+        """Flag deploy/release jobs without an environment: declaration."""
+        if not self._rule_applies("environment-protection"):
+            return []
+        name = str(job_data.get("name", "")).lower()
+        job_id_l = str(job_id).lower()
+        is_deploy = (
+            "deploy" in name or "deploy" in job_id_l
+            or "release" in name or "release" in job_id_l
+            or "publish" in name or "publish" in job_id_l
+        )
+        if not is_deploy:
+            return []
+        if "environment" not in job_data:
+            return [{
+                "rule": "environment-protection",
+                "location": f"jobs.{job_id}",
+                "message": f"Deployment job '{job_id}' does not declare an 'environment:'. Use a protected environment with required reviewers for production.",
+                "original": "missing",
+            }]
+        return []
+
+    def _check_docker_action_digest_pin(self, raw_data):
+        """Flag docker:// actions and container services pinned by tag (not digest)."""
+        findings = []
+        jobs = raw_data.get("jobs", {})
+        if not isinstance(jobs, dict):
+            return findings
+        for job_id, job_data in jobs.items():
+            if not isinstance(job_data, dict):
+                continue
+            # container: block
+            container = job_data.get("container")
+            if isinstance(container, dict):
+                image = str(container.get("image", ""))
+                if image and ":" in image and "@sha256:" not in image:
+                    findings.append({
+                        "rule": "docker-action-digest-pin",
+                        "location": f"jobs.{job_id}.container",
+                        "message": f"Container image '{image}' is pinned by tag, not digest. Pin to '@sha256:...'.",
+                        "original": image,
+                    })
+            elif isinstance(container, str) and ":" in container and "@sha256:" not in container:
+                findings.append({
+                    "rule": "docker-action-digest-pin",
+                    "location": f"jobs.{job_id}.container",
+                    "message": f"Container image '{container}' is pinned by tag, not digest. Pin to '@sha256:...'.",
+                    "original": container,
+                })
+            # services: blocks
+            services = job_data.get("services")
+            if isinstance(services, dict):
+                for svc_name, svc in services.items():
+                    if not isinstance(svc, dict):
+                        continue
+                    image = str(svc.get("image", ""))
+                    if image and ":" in image and "@sha256:" not in image:
+                        findings.append({
+                            "rule": "docker-action-digest-pin",
+                            "location": f"jobs.{job_id}.services.{svc_name}",
+                            "message": f"Service '{svc_name}' image '{image}' is pinned by tag, not digest.",
+                            "original": image,
+                        })
+            # docker:// actions in steps
+            steps = job_data.get("steps", [])
+            if isinstance(steps, list):
+                for idx, step in enumerate(steps):
+                    if not isinstance(step, dict):
+                        continue
+                    uses_val = str(step.get("uses", ""))
+                    if uses_val.startswith("docker://") and "@" not in uses_val:
+                        findings.append({
+                            "rule": "docker-action-digest-pin",
+                            "location": f"jobs.{job_id}.steps[{idx}]",
+                            "message": f"Docker action '{uses_val}' is not pinned by digest. Use 'docker://image@sha256:...'.",
+                            "original": uses_val,
+                        })
+        return findings
+
+    def _check_missing_set_x_pipefail(self, job_id, idx, step):
+        """Flag multi-line bash run: scripts lacking 'set -e -o pipefail'."""
+        if not self._rule_applies("missing-set-x-pipefail"):
+            return []
+        run_val = step.get("run")
+        if not run_val or not isinstance(run_val, str):
+            return []
+        lines = [l for l in run_val.split("\n") if l.strip()]
+        if len(lines) < 3:
+            return []
+        shell = str(step.get("shell", "")).lower()
+        # Only flag bash/sh shells (not pwsh/cmd/python).
+        if shell and shell not in ("bash", "sh"):
+            return []
+        first_lines = " ".join(lines[:2]).lower()
+        if "set -e" in first_lines or "set -o pipefail" in first_lines:
+            return []
+        # Skip if there's an explicit `if:` guarding the whole step.
+        return [{
+            "rule": "missing-set-x-pipefail",
+            "location": f"jobs.{job_id}.steps[{idx}]",
+            "message": "Multi-line bash run: script lacks 'set -e -o pipefail'; failures may be masked. Add it at the top of the script.",
+            "original": f"{len(lines)} lines",
+        }]
+
+    def _check_token_passed_to_third_party(self, raw_data):
+        """Flag GITHUB_TOKEN/secrets passed via env: to non-first-party actions."""
+        if not self._rule_applies("token-passed-to-third-party"):
+            return []
+        jobs = raw_data.get("jobs", {})
+        if not isinstance(jobs, dict):
+            return []
+        findings = []
+        for job_id, job_data in jobs.items():
+            if not isinstance(job_data, dict):
+                continue
+            steps = job_data.get("steps", [])
+            if not isinstance(steps, list):
+                continue
+            for idx, step in enumerate(steps):
+                if not isinstance(step, dict):
+                    continue
+                uses_val = str(step.get("uses", ""))
+                if not uses_val or "@" not in uses_val:
+                    continue
+                action_ref = uses_val.split("@", 1)[0]
+                env_block = step.get("env")
+                if not isinstance(env_block, dict):
+                    continue
+                token_refs = [
+                    k for k, v in env_block.items()
+                    if isinstance(v, str) and re.search(r"\$\{\{\s*(secrets\.|github\.token|env\.GITHUB_TOKEN)", v)
+                ]
+                if not token_refs:
+                    continue
+                # First-party orgs are trusted.
+                if any(action_ref.startswith(org) for org in self.trusted_orgs):
+                    continue
+                findings.append({
+                    "rule": "token-passed-to-third-party",
+                    "location": f"jobs.{job_id}.steps[{idx}]",
+                    "message": (
+                        f"Token/secret passed via env to third-party action '{action_ref}'. "
+                        "Audit the action's trust level; third-party actions can exfiltrate credentials."
+                    ),
+                    "original": ", ".join(token_refs),
+                })
+        return findings
+
+    def _check_always_deploy_after_failure(self, job_id, job_data, all_jobs):
+        """Flag deploy jobs gated with if: always() after a test/build job."""
+        if not self._rule_applies("always-deploy-after-failure"):
+            return []
+        if_expr = str(job_data.get("if", ""))
+        if "always()" not in if_expr.replace(" ", ""):
+            return []
+        # Must be a deploy-ish job.
+        name = str(job_data.get("name", "")).lower()
+        if "deploy" not in name and "deploy" not in str(job_id).lower() and "release" not in name and "publish" not in name:
+            return []
+        needs = job_data.get("needs", [])
+        if isinstance(needs, str):
+            needs = [needs]
+        if not needs:
+            return []
+        # Report the upstream jobs that could fail silently.
+        upstream = [n for n in needs if isinstance(n, str) and n in all_jobs]
+        return [{
+            "rule": "always-deploy-after-failure",
+            "location": f"jobs.{job_id}",
+            "message": (
+                f"Deploy job '{job_id}' uses if: always() and depends on {upstream}; "
+                "it will deploy even when an upstream job fails. Use "
+                "if: success() or needs.<job>.result == 'success'."
+            ),
+            "original": if_expr,
+        }]
+
+    def _check_matrix_fail_fast(self, job_id, job_data):
+        """Flag matrix jobs with fail-fast: true."""
+        if not self._rule_applies("matrix-fail-fast"):
+            return []
+        strategy = job_data.get("strategy")
+        if not isinstance(strategy, dict):
+            return []
+        if "fail-fast" not in strategy:
+            return []
+        if strategy.get("fail-fast") is True:
+            return [{
+                "rule": "matrix-fail-fast",
+                "location": f"jobs.{job_id}.strategy",
+                "message": "Matrix has fail-fast: true; the entire matrix aborts on the first failure, hiding later failures. Consider fail-fast: false for diagnostics.",
+                "original": "fail-fast: true",
+            }]
+        return []
+
+
+def _strip_noise(text: str) -> str:
+    """Return text with shell comment lines and echo-quoted strings removed.
+
+    Prevents false positives where a substring like ``docker push`` appears
+    in a comment (``# docker push ...``) or inside an echo string
+    (``echo "docker push not used"``). Lines are processed individually so
+    inline comments after code are also stripped at the first ``#`` outside
+    quotes.
+    """
+    if not text:
+        return ""
+    out_lines = []
+    for line in text.splitlines():
+        # Skip full-line comments.
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        # Strip trailing inline comment (naive: first unquoted #).
+        in_single = in_double = False
+        cut = len(line)
+        for i, ch in enumerate(line):
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif ch == "#" and not in_single and not in_double:
+                cut = i
+                break
+        out_lines.append(line[:cut])
+    return "\n".join(out_lines)

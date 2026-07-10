@@ -105,28 +105,6 @@ def test_checkout_persist_credentials_not_flagged_for_non_checkout() -> None:
     assert len(cpc) == 0
 
 
-# ─── Checkout fetch depth ────────────────────────────────────────────
-
-def test_checkout_fetch_depth_zero_flagged() -> None:
-    a = _make_analyzer()
-    data = {"jobs": {"build": {"runs-on": "ubuntu-latest", "steps": [
-        {"uses": "actions/checkout@v4", "with": {"fetch-depth": 0}}
-    ]}}}
-    findings = a.analyze_workflow("/f.yml", data)
-    fd = [f for f in findings if f["rule"] == "checkout-fetch-depth"]
-    assert len(fd) == 1
-
-
-def test_checkout_fetch_depth_one_not_flagged() -> None:
-    a = _make_analyzer()
-    data = {"jobs": {"build": {"runs-on": "ubuntu-latest", "steps": [
-        {"uses": "actions/checkout@v4", "with": {"fetch-depth": 1}}
-    ]}}}
-    findings = a.analyze_workflow("/f.yml", data)
-    fd = [f for f in findings if f["rule"] == "checkout-fetch-depth"]
-    assert len(fd) == 0
-
-
 # ─── Step timeout ────────────────────────────────────────────────────
 
 def test_long_step_timeout_missing_flagged() -> None:
@@ -414,18 +392,15 @@ def test_linux_commands_on_windows_flagged() -> None:
     assert len(shell) >= 1
 
 
-def test_powershell_on_linux_flagged() -> None:
+def test_powershell_on_linux_not_flagged_when_cross_platform() -> None:
     a = _make_analyzer()
     data = {"jobs": {"build": {
         "runs-on": "ubuntu-latest",
-        "steps": [{"shell": "pwsh", "run": "Get-ChildItem | Select-Object Name"}],
+        "steps": [{"run": "Get-ChildItem | Select-Object Name"}],
     }}}
     findings = a.analyze_workflow("/f.yml", data)
     shell = [f for f in findings if f["rule"] == "runner-shell-misalignment"]
-    # pwsh on Linux is technically valid if explicitly set; only flag if it's
-    # a mismatch without shell: being set.
-    # The bidirectional check flags if shell is set to pwsh on non-Windows.
-    # This is debatable; adjust test if the implementation differs.
+    assert len(shell) == 0
 
 
 def test_macos_shell_mismatch_flagged() -> None:
@@ -451,11 +426,7 @@ def test_coverity_missing_on_non_build_workflow() -> None:
     }
     findings = a.analyze_workflow("/f.yml", data)
     cov = [f for f in findings if f["rule"] == "coverity-scan"]
-    # _check_global_security_gates fires unconditionally — this is an existing
-    # limitation (it flags all workflows). The rule is informational for build.
-    # Accept whatever the implementation produces (it may be > 0 due to the
-    # unconditional global check). We just verify it doesn't crash.
-    assert isinstance(cov, list)
+    assert len(cov) == 0
 
 
 # ─── GitLab var map completeness ────────────────────────────────────

@@ -28,7 +28,6 @@ _RULE_SUMMARIES: dict[str, str] = {
     "bdba-scan": "BDBA vulnerability scan is not configured on built images.",
     "oidc-cloud-deploy": "Cloud deploy step should use OIDC (id-token: write).",
     "checkout-persist-credentials": "actions/checkout should set persist-credentials: false.",
-    "checkout-fetch-depth": "actions/checkout should set fetch-depth: 0 for audit pipelines.",
     "job-timeout-missing": "Job is missing timeout-minutes.",
     "step-timeout-missing": "Long-running step is missing timeout-minutes.",
     "latest-runtime-version": "Runtime version is set to 'latest' (non-reproducible).",
@@ -39,6 +38,17 @@ _RULE_SUMMARIES: dict[str, str] = {
     "reusable-workflow-pinned": "Reusable workflow call is not pinned to a commit SHA.",
     "job-permission-escalation": "Job re-widens permissions beyond the workflow default.",
     "concurrency-control": "State-modifying workflow should declare a concurrency group.",
+    "pull-request-target-danger": "pull_request_target with PR-head checkout executes untrusted code with base secrets.",
+    "self-hosted-runner-public-repo": "runs-on: self-hosted without a label risks untrusted code execution.",
+    "secret-in-run-literal": "Hardcoded credential literal in run: script.",
+    "secret-echoed-in-logs": "Secret interpolated directly in run: is echoed in logs.",
+    "expression-in-run-injection": "Untrusted ${{ github.event.* }} expression interpolated in run:.",
+    "environment-protection": "Deployment job lacks an environment: with required reviewers.",
+    "docker-action-digest-pin": "Docker image/action pinned by tag, not digest.",
+    "missing-set-x-pipefail": "Multi-line bash run: lacks 'set -e -o pipefail'.",
+    "token-passed-to-third-party": "Token/secret passed via env to a third-party action.",
+    "always-deploy-after-failure": "Deploy job uses if: always() and deploys on upstream failure.",
+    "matrix-fail-fast": "Matrix has fail-fast: true, hiding later failures.",
 }
 
 
@@ -87,10 +97,10 @@ class ReportGenerator:
                 continue
             md.append(f"## {label}\n")
             for idx, v in enumerate(group):
-                rule = v.get("rule")
+                rule = v.get("rule") or "unknown"
                 file_path = v.get("file", "")
-                loc = v.get("location")
-                msg = v.get("message")
+                loc = v.get("location") or "unknown"
+                msg = v.get("message") or rule
                 orig = v.get("original")
                 md.append(f"### {idx+1}. Rule: `{rule}`")
                 if file_path:
@@ -172,9 +182,6 @@ class ReportGenerator:
             "checkout-persist-credentials": (
                 "- uses: actions/checkout@v4\n  with:\n    persist-credentials: false"
             ),
-            "checkout-fetch-depth": (
-                "- uses: actions/checkout@v4\n  with:\n    fetch-depth: 0"
-            ),
             "job-timeout-missing": "timeout-minutes: 30",
             "step-timeout-missing": "timeout-minutes: 10",
             "runner-version-pinned": "runs-on: ubuntu-22.04",
@@ -192,9 +199,55 @@ class ReportGenerator:
             "job-permission-escalation": (
                 "# Job-level permissions must not exceed workflow-level permissions."
             ),
+            "pull-request-target-danger": (
+                "# Do not check out PR head under pull_request_target.\n"
+                "on: [pull_request]   # use pull_request, NOT pull_request_target, for builds\n"
+                "  - uses: actions/checkout@v4  # checks out the PR head safely (no base secrets)"
+            ),
+            "self-hosted-runner-public-repo": (
+                "# Use GitHub-hosted runners or label-gated self-hosted runners.\n"
+                "runs-on: ubuntu-latest   # or [self-hosted, corp-only]"
+            ),
+            "secret-in-run-literal": (
+                "# Bind credentials via env, never inline.\n"
+                "env:\n  API_KEY: ${{ secrets.API_KEY }}\nrun: curl -H \"Authorization: Bearer $API_KEY\" ..."
+            ),
+            "secret-echoed-in-logs": (
+                "# Bind secrets through env, not directly in run:.\n"
+                "env:\n  TOKEN: ${{ secrets.TOKEN }}\nrun: curl -H \"Authorization: Bearer $TOKEN\" ..."
+            ),
+            "expression-in-run-injection": (
+                "# Assign untrusted expressions to env first, then use $VAR.\n"
+                "env:\n  TITLE: ${{ github.event.issue.title }}\nrun: echo \"sanitized: $TITLE\""
+            ),
+            "environment-protection": (
+                "environment:\n  name: production\n  url: ${{ steps.deploy.outputs.url }}"
+            ),
+            "docker-action-digest-pin": (
+                "# Pin by immutable digest, not tag.\n"
+                "container:\n  image: registry/app@sha256:<digest>"
+            ),
+            "missing-set-x-pipefail": (
+                "run: |\n  set -e -o pipefail\n  # rest of script"
+            ),
+            "token-passed-to-third-party": (
+                "# Audit the action's trust level before passing tokens.\n"
+                "# Prefer first-party actions, or pass a minimally-scoped PAT."
+            ),
+            "always-deploy-after-failure": (
+                "# Gate deploys on upstream success.\n"
+                "if: ${{ success() }}   # or: needs.<job>.result == 'success'"
+            ),
+            "matrix-fail-fast": (
+                "strategy:\n  fail-fast: false\n  matrix:\n    os: [ubuntu-22.04, ubuntu-latest]"
+            ),
         }
         if rule in suggestions:
             return suggestions[rule]
+        # Consume remediation_hint from the violation dict if present
+        hint = (violation or {}).get("remediation_hint")
+        if hint:
+            return str(hint)
         # Generic GitLab var swap suggestion
         if rule == "residual-gitlab-vars" and isinstance(original, str):
             return f"# Replace with GitHub context\necho \"...${{{{ github.sha }}}}...\"   # was: {original}"
@@ -290,7 +343,7 @@ class ReportGenerator:
             file_uri = html.escape(v.get("file", ""))
             loc = html.escape(v.get("location", ""))
             message = html.escape(v.get("message", ""))
-            severity = v.get("severity", "warning")
+            severity = html.escape(v.get("severity", "warning"))
             classname = f"github-actions-checks.{severity}"
             case = (
                 f'  <testcase classname="{classname}" '
@@ -300,6 +353,8 @@ class ReportGenerator:
                 case += f'<failure type="{name}" message="{message}">{loc}</failure>'
             elif severity == "warning":
                 case += f'<skipped message="{message}"/>'
+            else:
+                case += f'<system-out>{message}</system-out>'
             case += '</testcase>'
             cases.append(case)
         body = "\n".join(cases)

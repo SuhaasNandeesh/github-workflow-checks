@@ -1,197 +1,325 @@
-# GitHub Actions Pipeline Audit Report
+# Pipeline Migration Analysis: .github
 
-## Repository: `.github`
+This report summarizes the compliance, security, and standard violations detected in the migrated GitHub Actions workflows.
 
-This report provides an analysis of the GitHub Actions workflows in the repository, highlighting security, efficiency, and compliance issues. Below is a summary of the findings, followed by detailed explanations and remediation steps.
+## Executive Compliance Dashboard
+| Metric | Count |
+| :--- | :--- |
+| **Critical Errors** | 8 |
+| **Standard Warnings** | 9 |
+| **Info Notices** | 4 |
+| **Uncategorized** | 0 |
+| **Total Violations** | 21 |
 
----
+## [Critical Errors] Action Required
 
-## Summary of Findings
+### 1. Rule: `least-privilege-token`
+- **File**: `.github/workflows/ci.yml`
+- **Location**: `workflow.permissions`
+- **Issue**: Workflow does not declare explicit GITHUB_TOKEN permissions. Set default to read-only or empty 'permissions: {}' at the top-level.
+- **Original Source**: `missing`
 
-| Severity | Count |
-|----------|-------|
-| Errors   | 7     |
-| Warnings | 6     |
-| Infos    | 0     |
-| **Total** | **13** |
-
----
-
-## Errors
-
-### 1. Missing Explicit `GITHUB_TOKEN` Permissions
-**Description**: Workflows do not declare explicit `GITHUB_TOKEN` permissions. By default, workflows have broad permissions, which can lead to security risks. It is recommended to set permissions to `read-only` or explicitly define required permissions.
-
-**Remediation**:
-Add the following block at the top level of the workflow file:
+- **Recommended Remediated Snippet**:
 ```yaml
 permissions:
   contents: read
 ```
 
-**Occurrences**:
-| File                          | Location               | Original  |
-|-------------------------------|------------------------|-----------|
-| `.github/workflows/ci.yml`    | `workflow.permissions` | missing   |
-| `.github/workflows/deploy.yml`| `workflow.permissions` | missing   |
-
 ---
 
-### 2. Actions Not Pinned to Immutable SHA
-**Description**: Actions should be pinned to a specific commit SHA to prevent supply chain attacks. Using tags or branches (e.g., `v4`) can lead to untrusted code execution if the tag is updated.
+### 2. Rule: `pin-action-sha`
+- **File**: `.github/workflows/ci.yml`
+- **Location**: `jobs.build.steps[0]`
+- **Issue**: Action 'actions/checkout' is pinned to tag/branch 'v4' instead of an immutable commit SHA.
+- **Original Source**: `actions/checkout@v4`
 
-**Remediation**:
-Replace the action reference with a specific commit SHA:
+- **Recommended Remediated Snippet**:
 ```yaml
-uses: actions/checkout@<commit-sha>
+# Pin action to immutable SHA
+uses: actions/checkout@<latest-commit-sha>  # v4
 ```
 
-**Occurrences**:
-| File                          | Location               | Original            |
-|-------------------------------|------------------------|---------------------|
-| `.github/workflows/ci.yml`    | `jobs.build.steps[0]`  | `actions/checkout@v4` |
-| `.github/workflows/deploy.yml`| `jobs.publish.steps[0]`| `actions/checkout@v4` |
-
 ---
 
-### 3. Residual GitLab CI Variable Reference
-**Description**: The workflow contains a reference to a GitLab CI variable (`$CI_PROJECT_NAME`), which is not valid in GitHub Actions. This can cause runtime errors.
+### 3. Rule: `residual-gitlab-vars`
+- **File**: `.github/workflows/ci.yml`
+- **Location**: `jobs.build.steps[1]`
+- **Issue**: Shell step contains residual GitLab CI variable reference '$CI_PROJECT_NAME'.
+- **Original Source**: `$CI_PROJECT_NAME`
 
-**Remediation**:
-Replace the variable with an appropriate GitHub Actions context or remove it:
+- **Recommended Remediated Snippet**:
 ```yaml
-run: echo "Building project ${{ github.repository }}..."
+# Replace with GitHub context
+echo "...${{ github.sha }}..."   # was: $CI_PROJECT_NAME
 ```
 
-**Occurrences**:
-| File                       | Location               | Original         |
-|----------------------------|------------------------|------------------|
-| `.github/workflows/ci.yml` | `jobs.build.steps[1]`  | `$CI_PROJECT_NAME` |
-
 ---
 
-### 4. Circular Job Dependency
-**Description**: A circular dependency exists between the `publish` and `validate` jobs, causing a deadlock. Jobs cannot depend on each other.
+### 4. Rule: `residual-gitlab-vars`
+- **File**: `.github/workflows/ci.yml`
+- **Location**: `jobs.build.steps[1]`
+- **Issue**: Shell step contains residual GitLab CI variable reference '$CI_PROJECT_NAME'.
+- **Original Source**: `$CI_PROJECT_NAME`
 
-**Remediation**:
-Remove the circular dependency by restructuring the workflow:
+- **Recommended Remediated Snippet**:
 ```yaml
-jobs:
-  validate:
-    needs: []
-  publish:
-    needs: [validate]
+# Replace with GitHub context
+echo "...${{ github.sha }}..."   # was: $CI_PROJECT_NAME
 ```
 
-**Occurrences**:
-| File                          | Location         | Original            |
-|-------------------------------|------------------|---------------------|
-| `.github/workflows/deploy.yml`| `workflow.jobs`  | `publish -> validate` |
-
 ---
 
-### 5. Runner-Shell Misalignment
-**Description**: A job running on `windows-latest` contains Linux-specific commands (`mkdir -p`, `tar`) without specifying `shell: bash`. This will fail on Windows runners.
+### 5. Rule: `job-dependency-cycle`
+- **File**: `.github/workflows/deploy.yml`
+- **Location**: `workflow.jobs`
+- **Issue**: Circular dependency deadlock detected between jobs 'publish' and 'validate'.
+- **Original Source**: `publish -> validate`
 
-**Remediation**:
-Specify the shell explicitly:
+- **Recommended Remediated Snippet**:
 ```yaml
-shell: bash
-run: |
-  mkdir -p build/logs
-  echo "Validating target..."
+# Break the cycle by removing one of the 'needs' edges.
 ```
 
-**Occurrences**:
-| File                          | Location               | Original                                                                 |
-|-------------------------------|------------------------|--------------------------------------------------------------------------|
-| `.github/workflows/deploy.yml`| `jobs.validate.steps[0]`| `mkdir -p build/logs # Violates runner-shell-misalignment on Windows` |
-
 ---
 
-## Warnings
+### 6. Rule: `least-privilege-token`
+- **File**: `.github/workflows/deploy.yml`
+- **Location**: `workflow.permissions`
+- **Issue**: Workflow does not declare explicit GITHUB_TOKEN permissions. Set default to read-only or empty 'permissions: {}' at the top-level.
+- **Original Source**: `missing`
 
-### 1. Missing Coverity Scan
-**Description**: The workflow does not include a Coverity scan for static analysis and secrets checking. This is a best practice for ensuring code quality and security.
-
-**Remediation**:
-Add a Coverity scan step:
+- **Recommended Remediated Snippet**:
 ```yaml
-steps:
-  - name: Run Coverity Scan
-    uses: coverity/scan-action@v1
-    with:
-      project: my-project
+permissions:
+  contents: read
 ```
 
-**Occurrences**:
-| File                          | Location   | Original  |
-|-------------------------------|------------|-----------|
-| `.github/workflows/ci.yml`    | `workflow` | missing   |
-| `.github/workflows/deploy.yml`| `workflow` | missing   |
-
 ---
 
-### 2. Missing Docker Image Build and Push to JFrog
-**Description**: The workflow does not include steps to build and push Docker images to JFrog Artifactory. This is recommended for containerized applications.
+### 7. Rule: `runner-shell-misalignment`
+- **File**: `.github/workflows/deploy.yml`
+- **Location**: `jobs.validate.steps[0]`
+- **Issue**: Job runs on Windows, but step uses Linux commands ['mkdir -p', 'tar'] without setting 'shell: bash'.
+- **Original Source**: `mkdir -p build/logs # Violates runner-shell-misalignment on Windows
+echo "Validating target..."
+`
 
-**Remediation**:
-Add the following steps:
+- **Recommended Remediated Snippet**:
 ```yaml
-steps:
-  - name: Build Docker Image
-    run: docker build -t my-image:latest .
-  - name: Push to JFrog
-    run: docker push my-registry.jfrog.io/my-image:latest
+- name: Force bash on Windows
+  shell: bash
+  run: <your-commands>
 ```
 
-**Occurrences**:
-| File                          | Location   | Original  |
-|-------------------------------|------------|-----------|
-| `.github/workflows/ci.yml`    | `workflow` | missing   |
-| `.github/workflows/deploy.yml`| `workflow` | missing   |
+---
+
+### 8. Rule: `pin-action-sha`
+- **File**: `.github/workflows/deploy.yml`
+- **Location**: `jobs.publish.steps[0]`
+- **Issue**: Action 'actions/checkout' is pinned to tag/branch 'v4' instead of an immutable commit SHA.
+- **Original Source**: `actions/checkout@v4`
+
+- **Recommended Remediated Snippet**:
+```yaml
+# Pin action to immutable SHA
+uses: actions/checkout@<latest-commit-sha>  # v4
+```
 
 ---
 
-### 3. Missing Concurrency Control
-**Description**: State-modifying workflows (e.g., deployment) should configure `concurrency` to prevent execution collisions.
+## [Standard Warnings] Policy Guidelines
 
-**Remediation**:
-Add a `concurrency` block:
+### 1. Rule: `job-timeout-missing`
+- **File**: `.github/workflows/ci.yml`
+- **Location**: `jobs.build`
+- **Issue**: Job 'build' does not declare 'timeout-minutes'. Hung builds may consume runner resources indefinitely.
+- **Original Source**: `missing`
+
+- **Recommended Remediated Snippet**:
+```yaml
+timeout-minutes: 30
+```
+
+---
+
+### 2. Rule: `checkout-persist-credentials`
+- **File**: `.github/workflows/ci.yml`
+- **Location**: `jobs.build.steps[0]`
+- **Issue**: actions/checkout should set 'persist-credentials: false' to prevent the token from persisting in post-checkout steps.
+- **Original Source**: `actions/checkout@v4`
+
+- **Recommended Remediated Snippet**:
+```yaml
+- uses: actions/checkout@v4
+  with:
+    persist-credentials: false
+```
+
+---
+
+### 3. Rule: `coverity-scan`
+- **File**: `.github/workflows/ci.yml`
+- **Location**: `workflow`
+- **Issue**: Coverity scan (SAST / secrets checking) is not configured in this workflow.
+- **Original Source**: `missing`
+
+- **Recommended Remediated Snippet**:
+```yaml
+- name: Black Duck Coverity Scan
+  uses: blackduck-inc/black-duck-security-scan@v2
+  with:
+    api_token: ${{ secrets.BD_TOKEN }}
+    server_url: ${{ secrets.BD_URL }}
+    coverity_url: ${{ secrets.COVERITY_URL }}
+    coverity_user: ${{ secrets.COVERITY_USER }}
+    coverity_pass: ${{ secrets.COVERITY_PASS }}
+```
+
+---
+
+### 4. Rule: `concurrency-control`
+- **File**: `.github/workflows/deploy.yml`
+- **Location**: `workflow.concurrency`
+- **Issue**: State-modifying workflow (deployment/release) should configure 'concurrency' to prevent execution collisions.
+- **Original Source**: `missing`
+
+- **Recommended Remediated Snippet**:
 ```yaml
 concurrency:
-  group: deployment-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 ```
 
-**Occurrences**:
-| File                          | Location               | Original  |
-|-------------------------------|------------------------|-----------|
-| `.github/workflows/deploy.yml`| `workflow.concurrency` | missing   |
-
 ---
 
-### 4. Unbound Secrets Reference
-**Description**: A shell step references a credentials variable (`$PROD_API_KEY`) that is not explicitly bound in the `env` parameters. This can lead to runtime errors or security issues.
+### 5. Rule: `job-timeout-missing`
+- **File**: `.github/workflows/deploy.yml`
+- **Location**: `jobs.validate`
+- **Issue**: Job 'validate' does not declare 'timeout-minutes'. Hung builds may consume runner resources indefinitely.
+- **Original Source**: `missing`
 
-**Remediation**:
-Bind the variable explicitly in the `env` block:
+- **Recommended Remediated Snippet**:
 ```yaml
-env:
-  PROD_API_KEY: ${{ secrets.PROD_API_KEY }}
+timeout-minutes: 30
 ```
 
-**Occurrences**:
-| File                          | Location               | Original      |
-|-------------------------------|------------------------|---------------|
-| `.github/workflows/deploy.yml`| `jobs.publish.steps[1]`| `$PROD_API_KEY` |
+---
+
+### 6. Rule: `job-timeout-missing`
+- **File**: `.github/workflows/deploy.yml`
+- **Location**: `jobs.publish`
+- **Issue**: Job 'publish' does not declare 'timeout-minutes'. Hung builds may consume runner resources indefinitely.
+- **Original Source**: `missing`
+
+- **Recommended Remediated Snippet**:
+```yaml
+timeout-minutes: 30
+```
 
 ---
 
-## Infos
+### 7. Rule: `checkout-persist-credentials`
+- **File**: `.github/workflows/deploy.yml`
+- **Location**: `jobs.publish.steps[0]`
+- **Issue**: actions/checkout should set 'persist-credentials: false' to prevent the token from persisting in post-checkout steps.
+- **Original Source**: `actions/checkout@v4`
 
-No informational findings were detected in this audit.
+- **Recommended Remediated Snippet**:
+```yaml
+- uses: actions/checkout@v4
+  with:
+    persist-credentials: false
+```
 
 ---
 
-This concludes the audit report for the `.github` repository. Please address the identified issues to improve the security, efficiency, and compliance of your GitHub Actions workflows.
+### 8. Rule: `environment-protection`
+- **File**: `.github/workflows/deploy.yml`
+- **Location**: `jobs.publish`
+- **Issue**: Deployment job 'publish' does not declare an 'environment:'. Use a protected environment with required reviewers for production.
+- **Original Source**: `missing`
+
+- **Recommended Remediated Snippet**:
+```yaml
+environment:
+  name: production
+  url: ${{ steps.deploy.outputs.url }}
+```
+
+---
+
+### 9. Rule: `coverity-scan`
+- **File**: `.github/workflows/deploy.yml`
+- **Location**: `workflow`
+- **Issue**: Coverity scan (SAST / secrets checking) is not configured in this workflow.
+- **Original Source**: `missing`
+
+- **Recommended Remediated Snippet**:
+```yaml
+- name: Black Duck Coverity Scan
+  uses: blackduck-inc/black-duck-security-scan@v2
+  with:
+    api_token: ${{ secrets.BD_TOKEN }}
+    server_url: ${{ secrets.BD_URL }}
+    coverity_url: ${{ secrets.COVERITY_URL }}
+    coverity_user: ${{ secrets.COVERITY_USER }}
+    coverity_pass: ${{ secrets.COVERITY_PASS }}
+```
+
+---
+
+## [Info Notices]
+
+### 1. Rule: `runner-version-pinned`
+- **File**: `.github/workflows/ci.yml`
+- **Location**: `jobs.build`
+- **Issue**: Job 'build' uses 'runs-on: latest' which is non-reproducible. Pin to a specific version.
+- **Original Source**: `ubuntu-latest`
+
+- **Recommended Remediated Snippet**:
+```yaml
+runs-on: ubuntu-22.04
+```
+
+---
+
+### 2. Rule: `missing-set-x-pipefail`
+- **File**: `.github/workflows/ci.yml`
+- **Location**: `jobs.build.steps[1]`
+- **Issue**: Multi-line bash run: script lacks 'set -e -o pipefail'; failures may be masked. Add it at the top of the script.
+- **Original Source**: `3 lines`
+
+- **Recommended Remediated Snippet**:
+```yaml
+run: |
+  set -e -o pipefail
+  # rest of script
+```
+
+---
+
+### 3. Rule: `runner-version-pinned`
+- **File**: `.github/workflows/deploy.yml`
+- **Location**: `jobs.validate`
+- **Issue**: Job 'validate' uses 'runs-on: latest' which is non-reproducible. Pin to a specific version.
+- **Original Source**: `windows-latest`
+
+- **Recommended Remediated Snippet**:
+```yaml
+runs-on: ubuntu-22.04
+```
+
+---
+
+### 4. Rule: `runner-version-pinned`
+- **File**: `.github/workflows/deploy.yml`
+- **Location**: `jobs.publish`
+- **Issue**: Job 'publish' uses 'runs-on: latest' which is non-reproducible. Pin to a specific version.
+- **Original Source**: `ubuntu-latest`
+
+- **Recommended Remediated Snippet**:
+```yaml
+runs-on: ubuntu-22.04
+```
+
+---
