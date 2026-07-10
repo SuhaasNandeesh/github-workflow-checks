@@ -1,0 +1,30 @@
+name: Deployment Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  validate:
+    name: Validate Environment
+    runs-on: windows-latest
+    needs: publish
+    steps:
+      - name: Setup environment
+        run: |
+          mkdir -p build/logs # Violates runner-shell-misalignment on Windows
+          echo "Validating target..."
+
+  publish:
+    name: Build & Push Release
+    runs-on: ubuntu-latest
+    needs: validate # Creates circular dependency with 'validate' (validate needs publish, publish needs validate)
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Deploy to Target
+        run: |
+          echo "Deploying..."
+          curl -H "Authorization: Bearer $PROD_API_KEY" https://api.prod.example.com/deploy # Violates unbound-secrets ($PROD_API_KEY)

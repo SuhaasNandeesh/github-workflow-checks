@@ -1,0 +1,60 @@
+{
+  "rules": {
+    "pin-action-sha": {
+      "severity": "error",
+      "description": "All external marketplace actions must be pinned to an immutable full-length commit SHA rather than tags or branches."
+    },
+    "coverity-scan": {
+      "severity": "warning",
+      "description": "Coverity SAST and secrets scanning should be configured for repository code."
+    },
+    "image-build-jfrog": {
+      "severity": "warning",
+      "description": "Workflow must configure building and pushing Docker images to the JFrog Artifactory registry."
+    },
+    "image-signing": {
+      "severity": "warning",
+      "description": "Container images pushed to JFrog registry must be signed using Cosign."
+    },
+    "bdba-scan": {
+      "severity": "warning",
+      "description": "Black Duck Binary Analysis (BDBA) vulnerability scans should execute on container images pulled from the JFrog registry."
+    },
+    "residual-gitlab-vars": {
+      "severity": "error",
+      "description": "Workflows must not contain legacy GitLab CI variables (e.g., $CI_PROJECT_NAME, $CI_COMMIT_SHA) inside shell steps."
+    },
+    "explicit-artifact-transfer": {
+      "severity": "warning",
+      "description": "Dependent jobs (defined in needs) requiring compiled outputs must use explicit actions/upload-artifact and actions/download-artifact steps."
+    },
+    "unbound-secrets": {
+      "severity": "warning",
+      "description": "Passwords, keys, or tokens used in shell scripts must be bound to env properties referencing secrets.<NAME>."
+    },
+    "runner-shell-misalignment": {
+      "severity": "error",
+      "description": "Jobs targetting Windows runner environments must specify 'shell: bash' for Linux/bash commands."
+    },
+    "multiline-block-scalar": {
+      "severity": "warning",
+      "description": "Multi-line run commands should use literal block scalars (|) rather than folded block scalars (>)."
+    },
+    "job-dependency-cycle": {
+      "severity": "error",
+      "description": "Circular dependency definitions in job 'needs' trees are forbidden."
+    },
+    "least-privilege-token": {
+      "severity": "error",
+      "description": "Limit GITHUB_TOKEN scope by setting 'permissions: {}' at the top-level workflow or job configuration."
+    },
+    "concurrency-control": {
+      "severity": "warning",
+      "description": "Configure concurrency groups on deployment or state-modifying pipelines to avoid execution collisions."
+    }
+  },
+  "suppressions": {
+    "global": [],
+    "by_repository": {}
+  }
+}

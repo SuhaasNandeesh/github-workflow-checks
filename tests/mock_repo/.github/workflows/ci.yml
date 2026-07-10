@@ -1,0 +1,20 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Compile and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4 # Violates pin-action-sha (tag instead of SHA)
+
+      - name: Build Application
+        run: |
+          echo "Building project $CI_PROJECT_NAME..." # Violates residual-gitlab-vars ($CI_PROJECT_NAME)
+          npm ci
+          npm run build
