@@ -1,8 +1,6 @@
 import json
 import os
 import re
-import urllib.error
-import urllib.request
 
 try:
     from ruamel.yaml.scalarstring import FoldedScalarString
@@ -10,7 +8,6 @@ except ImportError:
     FoldedScalarString = None
 
 from logging_setup import get_logger
-from copilot_client import SSLCertificateError
 
 logger = get_logger()
 
@@ -48,18 +45,18 @@ _RUNEXPR_RE = re.compile(r'\$\{\{\s*[^}]*\s*\}\}')
 
 class StaticAnalyzer:
     def __init__(self, rules_config=None, token: str | None = None,
-                 endpoint: str | None = None, api_endpoint: str | None = None,
-                 sha_cache_path: str | None = None):
+                 endpoint: str | None = None, api_endpoint: str | None = None):
         self.rules_config = rules_config or {}
         self.token = token or os.environ.get("GITHUB_TOKEN") or os.environ.get("COPILOT_TOKEN")
-        # GitHub API endpoint for action SHA resolution. Defaults: GHES endpoint
-        # if provided, else api.github.com.
+        # GitHub API endpoint. Kept for future use; currently no network calls
+        # are made by the analyzer (action SHA pinning is reported, not
+        # auto-fixed, so no API resolution is needed).
         cfg_endpoint = self.rules_config.get("endpoint") if isinstance(self.rules_config, dict) else None
         cfg_api = self.rules_config.get("api_endpoint") if isinstance(self.rules_config, dict) else None
         self.endpoint = (
             api_endpoint or cfg_api or endpoint or cfg_endpoint or "https://api.github.com"
         ).rstrip("/")
-        # Regex to match 40-character hex SHA
+        # Regex to match 40-character hex SHA (used for detection only).
         self.sha_pattern = re.compile(r'^[a-fA-F0-9]{40}$')
         # Default secret pattern; overridable via rules_config["secret_keyword_pattern"].
         # No leading \b so that prefixed names like PROD_API_KEY still match the
@@ -75,15 +72,6 @@ class StaticAnalyzer:
         self.trusted_orgs = tuple(
             self.rules_config.get("trusted_action_orgs", _DEFAULT_TRUSTED_ORGS)
         )
-        # Offline action-SHA cache: action@tag -> sha (or None on confirmed miss).
-        self._sha_cache: dict[str, str | None] = {}
-        self._sha_cache_dirty = False
-        self._sha_cache_path = (
-            sha_cache_path
-            or (self.rules_config.get("sha_cache_path") if isinstance(self.rules_config, dict) else None)
-            or "actions-sha-cache.json"
-        )
-        self._load_sha_cache()
         # Workflow scope cache per analyze_workflow call.
         self._scope: set[str] = set()
 
@@ -262,30 +250,6 @@ class StaticAnalyzer:
             scopes.add("deploy")
 
         return scopes
-
-    def _load_sha_cache(self) -> None:
-        try:
-            with open(self._sha_cache_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                self._sha_cache = {k: v for k, v in data.items() if v is None or (isinstance(v, str) and self.sha_pattern.match(v))}
-        except (OSError, json.JSONDecodeError):
-            self._sha_cache = {}
-
-    def persist_sha_cache(self) -> None:
-        """Flush the in-memory SHA cache to disk so it can be reused offline."""
-        if not self._sha_cache_dirty:
-            return
-        try:
-            tmp = self._sha_cache_path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._sha_cache, f, indent=2, sort_keys=True)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self._sha_cache_path)
-            self._sha_cache_dirty = False
-        except OSError as e:
-            logger.debug("Could not persist SHA cache to %s: %s", self._sha_cache_path, e)
 
     def _check_residual_gitlab_vars(self, job_id, step_idx, step):
         findings = []
@@ -786,97 +750,6 @@ class StaticAnalyzer:
         )
 
         return findings
-
-    def fetch_latest_sha(self, action_name, tag):
-        """Resolve an action's tag/branch to its immutable commit SHA.
-
-        Uses a persistent offline cache (``sha_cache_path``) so fix mode works
-        air-gapped. Subpath actions (e.g. ``org/repo/sub/dir@v1``) are rejected —
-        they cannot be safely resolved by the public git-refs API (A9).
-        """
-        parts = action_name.split('/')
-        if len(parts) < 2:
-            return None
-        owner, repo = parts[0], parts[1]
-        if len(parts) > 2:
-            logger.warning(
-                "Cannot resolve subpath action '%s' to a SHA via API; "
-                "use a full-length SHA instead.",
-                action_name,
-            )
-            return None
-
-        cache_key = f"{owner}/{repo}@{tag}"
-        if cache_key in self._sha_cache:
-            return self._sha_cache[cache_key]
-
-        sha = self._fetch_tag_sha(owner, repo, tag)
-        self._sha_cache[cache_key] = sha
-        self._sha_cache_dirty = True
-        return sha
-
-    def _fetch_tag_sha(self, owner: str, repo: str, tag: str) -> str | None:
-        url = f"{self.endpoint}/repos/{owner}/{repo}/git/ref/tags/{tag}"
-        headers = {
-            "User-Agent": "github-actions-checks/1.0",
-            "Accept": "application/vnd.github+json",
-        }
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-        req = urllib.request.Request(url, headers=headers)
-
-        try:
-            response = urllib.request.urlopen(req, timeout=5)
-        except urllib.error.HTTPError as e:
-            if e.code in (403, 429):
-                logger.warning(
-                    "Rate-limited resolving %s/%s@%s (HTTP %d); skipping.",
-                    owner, repo, tag, e.code,
-                )
-                return None
-            if e.code == 404:
-                logger.debug("%s/%s@%s not found (HTTP 404).", owner, repo, tag)
-                return None
-            logger.warning("HTTP %d resolving %s/%s@%s: %s", e.code, owner, repo, tag, e.reason)
-            return None
-        except urllib.error.URLError as e:
-            if isinstance(e.reason, Exception) and "CERTIFICATE_VERIFY_FAILED" in str(e.reason):
-                raise SSLCertificateError(
-                    "TLS verification failed while resolving action SHAs. "
-                    "Install root certificates (see README §1) and retry."
-                ) from e
-            logger.debug("Network error resolving %s/%s@%s: %s", owner, repo, tag, e)
-            return None
-        except OSError as e:
-            logger.debug("OS error resolving %s/%s@%s: %s", owner, repo, tag, e)
-            return None
-
-        try:
-            data = json.loads(response.read().decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return None
-
-        obj = data.get("object", {})
-        if obj.get("type") == "commit":
-            return obj.get("sha")
-        if obj.get("type") == "tag":
-            tag_url = obj.get("url")
-            if not tag_url:
-                return None
-            tag_req = urllib.request.Request(
-                tag_url, headers={**headers, "Accept": "application/vnd.github+json"}
-            )
-            try:
-                tag_resp = urllib.request.urlopen(tag_req, timeout=5)
-            except (urllib.error.URLError, OSError) as e:
-                logger.debug("Failed to follow tag URL for %s/%s@%s: %s", owner, repo, tag, e)
-                return None
-            try:
-                tag_data = json.loads(tag_resp.read().decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                return None
-            return tag_data.get("object", {}).get("sha")
-        return None
 
     # ─── PR 3: New rule implementations ────────────────────────────────
 

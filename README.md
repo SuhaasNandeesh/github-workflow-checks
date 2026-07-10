@@ -82,6 +82,9 @@ non-structural fixes are routed to LLM sub-agents.
     logged to `.audit/<file>.fixer.json`. Warning/info non-programmatic
     violations are **not** sent to the LLM (credit conservation); they are
     written to `.audit/<file>.manual-review.json` for manual remediation.
+    `pin-action-sha` is also manual-review only — resolving a tag to a commit
+    SHA requires the GitHub API, which the framework does not call (fully
+    offline). Unpinned actions are reported so the owning team can pin manually.
 6.  **Documenter Agent (LLM, Sonnet-class)**: Reads verified findings and emits
     a Markdown `findings.md` directly (not JSON).
 
@@ -109,9 +112,8 @@ Sonnet is recommended only for the Documenter's prose.
 ```
 github-actions-checks/
 ├── .github-rules.json       # Central rules, severities, per-agent models, suppressions
-├── actions-sha-cache.json   # Offline action SHA cache (air-gapped fix mode)
 ├── README.md                # User onboarding and workflow documentation
-├── requirements.txt          # Python dependency specifications
+├── requirements.txt         # Python dependency specifications
 ├── cli.py                   # CLI entry point (argparse)
 ├── parser.py                # Round-trip ruamel.yaml parser + targeted AST extractor
 ├── static_analyzer.py       # Programmatic regex/structural validation (38+ rules)
@@ -149,56 +151,40 @@ pip install -r requirements.txt
 > *(Replace `3.x` with your specific installed Python directory name, e.g., `3.11`)*
 
 ### 2. Authenticate with GitHub Copilot
-The LLM agents consume credits directly from your GitHub Copilot subscription. The framework automatically attempts to extract your active Copilot OAuth session credentials.
+The LLM agents consume credits directly from your GitHub Copilot subscription
+(via your VS Code business account). The framework automatically extracts your
+active Copilot OAuth session credentials — **no separate login step is
+required if you are already signed into the VS Code Copilot extension.**
 
-To ensure authentication succeeds:
-*   Make sure you are logged into the **GitHub Copilot** extension in your current VS Code instance.
-*   *Alternatively*, install the [GitHub CLI](https://cli.github.com/) on your machine, open your terminal, and run:
-    ```bash
-    gh auth login
-    ```
-    This authenticates your command-line environment and allows the client to fetch your session token via `gh auth token`.
+The client resolves the token in this order:
+1. `COPILOT_TOKEN` / `GITHUB_TOKEN` environment variables.
+2. The VS Code Copilot session files (`~/.config/github-copilot/hosts.json`,
+   `~/.config/github-copilot/apps.json`) — this is what makes VS Code sign-in
+   sufficient.
+3. Fallback: the [GitHub CLI](https://cli.github.com/) via `gh auth token`
+   (only if you prefer CLI auth over the extension).
 
-### 3. GitHub Enterprise Server (GHES) Support
-The framework supports self-hosted GHES endpoints for both LLM completions and
-action SHA resolution. Configure via CLI or rules config:
+### 3. Fully Offline Operation
+The framework runs entirely against your locally downloaded/cloned repos and
+makes **no GitHub API requests**. The only network call is to the Copilot LLM
+endpoint (for the semantic/documenter/fixer agents), authenticated via your VS
+Code session as described above. If the LLM is unreachable, the framework
+gracefully degrades to the 0-credit static analyzer + static markdown report.
+
+`pin-action-sha` is reported as a finding but **not** auto-fixed, because
+resolving an action tag to a commit SHA would require the GitHub API. Unpinned
+actions are listed in `.audit/<file>.manual-review.json` for the owning team
+to pin manually.
+
+### 4. GitHub Enterprise Server (GHES) Support (optional)
+If your Copilot is hosted on a self-hosted GHES instance (rather than the
+default `api.githubcopilot.com`), point the LLM client at it:
 
 ```bash
-# Via CLI flag (applies to LLM + SHA resolution)
 python3 cli.py --mode report --dir ./repos --endpoint https://github.mycompany.com
-
-# Via rules config (.github-rules.json)
-{
-  "endpoint": "https://github.mycompany.com",
-  "api_endpoint": "https://github.mycompany.com/api/v3",
-  ...
-}
 ```
-`endpoint` is used for the Copilot chat API. `api_endpoint` (optional, defaults
-to `endpoint`) is used for action SHA resolution. For GHES, the client resolves
-host-specific tokens via `gh auth token --hostname <host>`.
-
-### 4. Offline / Air-gapped Fix Mode (Action SHA Cache)
-Fix mode resolves action tags to immutable commit SHAs via the GitHub API. To
-work fully offline (and avoid per-action 5s timeouts across 80+ repos), the
-cache file `actions-sha-cache.json` is read first; on a miss it falls back to
-the network and writes the result back for the next run. Override its location
-with `sha_cache_path` in `.github-rules.json`.
-
-The repository ships with a **pre-seeded** cache for common actions
-(checkout, setup-node/python/go/java, upload/download-artifact, cache) pinned
-to real commit SHAs. To refresh or extend the cache (e.g. after adding new
-common actions), run:
-
-```bash
-# Seed/refresh the cache from the GitHub API (network required).
-python3 cli.py --seed-sha-cache
-
-# For GitHub Enterprise Server:
-python3 cli.py --seed-sha-cache --endpoint https://github.mycompany.com
-```
-This resolves each seeded `action@tag` to its commit SHA and persists the
-cache. It does not run an audit.
+This is **not required** for a standard VS Code business-account Copilot setup
+— only set `--endpoint` if your organization hosts Copilot on GHES.
 
 ---
 

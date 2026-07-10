@@ -47,9 +47,11 @@ _EXIT_AUTH = 4
 _EXIT_BUDGET = 5
 
 # Rules that the orchestrator can fix programmatically (0 credit cost). Any
-# other rule with a finding is routed to the LLM Fixer agent.
+# other rule with a finding is routed to the LLM Fixer agent. Note:
+# pin-action-sha is intentionally NOT in this set — resolving a tag to a commit
+# SHA requires the GitHub API, which is not available in fully-offline runs.
+# Unpinned actions are reported as findings (manual-review.json) instead.
 _PROGRAMMATIC_FIX_RULES = frozenset({
-    "pin-action-sha",
     "residual-gitlab-vars",
     "runner-shell-misalignment",
     "least-privilege-token",
@@ -214,57 +216,12 @@ class AgentOrchestrator:
 
     def close(self) -> None:
         self.state_db.close()
-        # Persist the offline action SHA cache so fix mode works air-gapped next run.
-        with contextlib.suppress(Exception):
-            self.static_analyzer.persist_sha_cache()
 
     def __enter__(self) -> "AgentOrchestrator":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
-
-    # Actions to pre-populate the offline SHA cache with. Keyed by the tag that
-    # workflows actually use, so the cache is a direct hit on the common cases.
-    _SEED_ACTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
-        ("actions/checkout", ("v3", "v4")),
-        ("actions/setup-node", ("v3", "v4")),
-        ("actions/setup-python", ("v4", "v5")),
-        ("actions/setup-go", ("v4", "v5")),
-        ("actions/setup-java", ("v3", "v4")),
-        ("actions/upload-artifact", ("v3", "v4")),
-        ("actions/download-artifact", ("v3", "v4")),
-        ("actions/cache", ("v3", "v4")),
-    )
-
-    def seed_sha_cache(self) -> int:
-        """Populate the offline action SHA cache from the GitHub API.
-
-        Resolves each seeded action@tag to its commit SHA and writes the
-        result to the cache file so fix mode works air-gapped. Network access
-        is required; use --endpoint for GHES.
-        """
-        logger.info("Seeding offline action SHA cache at %s ...",
-                    self.static_analyzer._sha_cache_path)
-        resolved = 0
-        failed: list[str] = []
-        for action_name, tags in self._SEED_ACTIONS:
-            for tag in tags:
-                sha = self.static_analyzer.fetch_latest_sha(action_name, tag)
-                if sha and self.static_analyzer.sha_pattern.match(sha):
-                    resolved += 1
-                    logger.info("  %s@%s -> %s", action_name, tag, sha)
-                else:
-                    failed.append(f"{action_name}@{tag}")
-                    logger.warning("  %s@%s could not be resolved", action_name, tag)
-        self.static_analyzer.persist_sha_cache()
-        logger.info(
-            "SHA cache seeded: %d resolved, %d failed. Cache written to %s.",
-            resolved, len(failed), self.static_analyzer._sha_cache_path,
-        )
-        if failed:
-            logger.warning("Unresolved: %s", ", ".join(failed))
-        return _EXIT_OK
 
     def run_on_directory(self, target_dir: str | os.PathLike[str]) -> int:
         target = Path(target_dir)
@@ -1015,9 +972,7 @@ class AgentOrchestrator:
             location = violation.get("location", "")
             original = violation.get("original", "")
 
-            if rule_id == "pin-action-sha" and "steps" in location:
-                self._programmatic_pin_sha(data, location, original)
-            elif rule_id == "residual-gitlab-vars" and "steps" in location:
+            if rule_id == "residual-gitlab-vars" and "steps" in location:
                 self._programmatic_replace_gitlab_vars(data, location, original)
             elif rule_id == "runner-shell-misalignment" and "steps" in location:
                 self._programmatic_inject_bash_shell(data, location)
@@ -1043,34 +998,6 @@ class AgentOrchestrator:
                 "group": "${{ github.workflow }}-${{ github.ref }}",
                 "cancel-in-progress": True,
             }
-
-    def _programmatic_pin_sha(
-        self, data: Any, location: str, original_uses: str
-    ) -> None:
-        job_id, step_idx = _parse_location(location)
-        if job_id is None or step_idx is None:
-            return
-
-        try:
-            step = data["jobs"][job_id]["steps"][step_idx]
-        except (KeyError, IndexError, TypeError):
-            return
-
-        if "@" not in original_uses:
-            return
-        action_name, tag = original_uses.split("@", 1)
-        sha = self.static_analyzer.fetch_latest_sha(action_name, tag)
-        if not sha:
-            logger.warning(
-                "Could not resolve SHA for %s@%s; leaving step unchanged.",
-                action_name, tag,
-            )
-            return
-        step["uses"] = f"{action_name}@{sha}"
-        try:
-            step.yaml_add_eol_comment(f" {tag}", key="uses")
-        except Exception as e:
-            logger.debug("Could not attach EOL comment to uses: %s", e)
 
     def _programmatic_replace_gitlab_vars(
         self, data: Any, location: str, original_var: str

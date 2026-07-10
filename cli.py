@@ -148,16 +148,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Suppress non-error log output.",
     )
-    parser.add_argument(
-        "--seed-sha-cache",
-        action="store_true",
-        help=(
-            "Populate the offline action SHA cache (actions-sha-cache.json) "
-            "from the GitHub API for a built-in list of common actions, so "
-            "fix mode works air-gapped. Does not run an audit. Use with "
-            "--endpoint for GHES. Network access required."
-        ),
-    )
     return parser
 
 
@@ -185,12 +175,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     try:
-        if args.seed_sha_cache:
-            with AgentOrchestrator(
-                rules_path=args.config,
-                endpoint=args.endpoint,
-            ) as orchestrator:
-                return orchestrator.seed_sha_cache()
         with AgentOrchestrator(
             mode=args.mode,
             rules_path=args.config,

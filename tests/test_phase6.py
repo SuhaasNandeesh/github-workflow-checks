@@ -444,30 +444,6 @@ def test_static_analyzer_uses_ghes_endpoint():
     assert a.endpoint == "https://github.mycompany.com/api/v3"
 
 
-# ─── Offline SHA cache ──────────────────────────────────────────────
-
-
-def test_sha_cache_hit_skips_network(tmp_path):
-    cache = tmp_path / "sha-cache.json"
-    cache.write_text(json.dumps({"actions/checkout@v4": "a" * 40}))
-    a = StaticAnalyzer(rules_config={}, sha_cache_path=str(cache))
-    # Should return cached SHA without any network call.
-    sha = a.fetch_latest_sha("actions/checkout", "v4")
-    assert sha == "a" * 40
-
-
-def test_sha_cache_persisted_on_resolve(monkeypatch, tmp_path):
-    cache = tmp_path / "sha-cache.json"
-    a = StaticAnalyzer(rules_config={}, sha_cache_path=str(cache))
-    # Stub the network call to return a known SHA.
-    a._fetch_tag_sha = lambda owner, repo, tag: "b" * 40
-    sha = a.fetch_latest_sha("actions/checkout", "v4")
-    assert sha == "b" * 40
-    a.persist_sha_cache()
-    data = json.loads(cache.read_text())
-    assert data["actions/checkout@v4"] == "b" * 40
-
-
 # ─── Documenter prompt emits markdown ────────────────────────────────
 
 
@@ -512,7 +488,11 @@ def test_cli_budget_exhaustion_returns_exit_5(workspace, clean_env, monkeypatch)
 def test_fixer_max_iterations_constant():
     from agent_orchestrator import _FIXER_MAX_ITERATIONS, _PROGRAMMATIC_FIX_RULES
     assert _FIXER_MAX_ITERATIONS == 3
-    assert "pin-action-sha" in _PROGRAMMATIC_FIX_RULES
+    # pin-action-sha is intentionally NOT auto-fixed (SHA resolution requires
+    # the GitHub API, which is unavailable in fully-offline runs). It stays a
+    # finding for manual review.
+    assert "pin-action-sha" not in _PROGRAMMATIC_FIX_RULES
+    assert "residual-gitlab-vars" in _PROGRAMMATIC_FIX_RULES
     assert "coverity-scan" not in _PROGRAMMATIC_FIX_RULES
 
 
@@ -677,48 +657,3 @@ def test_fix_mode_invokes_llm_for_error_severity(tmp_path):
         "build.yml",
     )
     assert invoked["n"] == 1, "LLM Fixer must be invoked once for an error-severity violation"
-
-
-# ─── #4: SHA cache seeding ────────────────────────────────────────────
-
-
-def test_seed_sha_cache_resolves_and_persists(tmp_path):
-    """seed_sha_cache must resolve SHAs and persist them to the cache file."""
-    cache = tmp_path / "sha-cache.json"
-    cache.write_text("{}")
-    rules = tmp_path / ".github-rules.json"
-    rules.write_text(json.dumps({
-        "rules": {"pin-action-sha": {"severity": "error"}},
-        "suppressions": {"global": [], "by_repository": {}},
-    }))
-    orch = AgentOrchestrator(
-        rules_path=str(rules), state_db_path=str(tmp_path / "state.json"),
-        audit_dir=str(tmp_path / "audit"), reset=True, force=True,
-    )
-    orch.static_analyzer._sha_cache_path = str(cache)
-    # Clear the in-memory cache (populated at construction from the shipped
-    # actions-sha-cache.json) so the stub fetch is actually exercised.
-    orch.static_analyzer._sha_cache = {}
-    orch.static_analyzer._sha_cache_dirty = False
-    # Stub the network layer so the real fetch_latest_sha caching logic runs.
-    orch.static_analyzer._fetch_tag_sha = lambda owner, repo, tag: (
-        "a" * 40 if owner == "actions" and repo == "checkout" else None
-    )
-    # Force only one action to keep the test deterministic.
-    orch._SEED_ACTIONS = (("actions/checkout", ("v4",)),)
-    code = orch.seed_sha_cache()
-    assert code == 0
-    data = json.loads(cache.read_text())
-    assert data.get("actions/checkout@v4") == "a" * 40
-
-
-def test_sha_cache_empty_is_valid(tmp_path):
-    """An empty (or comment-only) cache file must load without error."""
-    cache = tmp_path / "sha-cache.json"
-    cache.write_text('{ "_comment": "empty cache" }')
-    a = StaticAnalyzer(rules_config={}, sha_cache_path=str(cache))
-    # The _comment key is rejected (not a SHA), so the cache is effectively empty.
-    assert a._sha_cache == {}
-    # A miss returns None only if confirmed; absent key -> network. With network
-    # stubbed off it would return None; here we just assert no crash on load.
-    assert isinstance(a._sha_cache, dict)

@@ -82,28 +82,6 @@ def test_least_privilege_replaces_write_all(workspace: Path, clean_env, orchestr
     assert data["permissions"] == {"contents": "read"}
 
 
-def test_sha_pinning_does_not_corrupt_uses_value(
-    workspace: Path, clean_env, orchestrator, monkeypatch
-) -> None:
-    workflow = workspace / "mock_repo" / ".github" / "workflows" / "ci.yml"
-    workflow.write_text(
-        "name: CI\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n"
-        "      - uses: actions/checkout@v4\n",
-        encoding="utf-8",
-    )
-    # Stub fetch to return a deterministic SHA.
-    orchestrator.static_analyzer.fetch_latest_sha = lambda name, tag: (
-        "a" * 40 if name == "actions/checkout" and tag == "v4" else None
-    )
-    data = orchestrator.parser.load_workflow(workflow)
-    orchestrator._programmatic_pin_sha(
-        data, "jobs.build.steps[0]", "actions/checkout@v4"
-    )
-    uses_value = data["jobs"]["build"]["steps"][0]["uses"]
-    assert "#" not in uses_value
-    assert uses_value == f"actions/checkout@{'a' * 40}"
-
-
 def test_gitlab_var_map_canonical_entries(workspace: Path, clean_env, orchestrator) -> None:
     from agent_orchestrator import GITLAB_VAR_MAP
     # Spot-check the canonical mappings we promised in the plan.

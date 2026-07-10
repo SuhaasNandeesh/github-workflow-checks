@@ -10,7 +10,6 @@ Supports:
 - ``semantic_audit``: global enable/disable for the LLM semantic auditor.
 - ``applies_to``: per-rule trigger scope (``source``, ``image``, ``deploy``,
   ``all``) controlling when global-gate rules fire.
-- ``sha_cache_path``: location of the offline action-SHA cache file.
 """
 from __future__ import annotations
 
@@ -60,10 +59,6 @@ SCHEMA: dict[str, Any] = {
                 "GitHub API base URL for action SHA resolution (defaults to "
                 "endpoint when set, otherwise https://api.github.com)."
             ),
-        },
-        "sha_cache_path": {
-            "type": "string",
-            "description": "Path to the offline action SHA cache JSON file.",
         },
         "secret_keyword_pattern": {
             "type": "string",
