@@ -153,9 +153,17 @@ class StaticAnalyzer:
         if uses_val.startswith("docker://"):
             return []
 
+        # Pick the most specific rule ID that applies to this action. The
+        # specialized rules (pin-setup-actions-sha, pin-artifact-actions-sha)
+        # are declared in .github-rules.json but were previously never emitted;
+        # emit them when the action matches and the rule is configured, so users
+        # can suppress the generic pin-action-sha while still getting the
+        # specialized findings. Falls back to the generic rule.
+        rule_id = self._pin_rule_for_action(uses_val)
+
         if "@" not in uses_val:
             return [{
-                "rule": "pin-action-sha",
+                "rule": rule_id,
                 "location": f"jobs.{job_id}.steps[{step_idx}]",
                 "message": f"Action '{uses_val}' does not specify a version or commit SHA ref.",
                 "original": uses_val
@@ -167,13 +175,29 @@ class StaticAnalyzer:
 
         if not self.sha_pattern.match(ref):
             return [{
-                "rule": "pin-action-sha",
+                "rule": rule_id,
                 "location": f"jobs.{job_id}.steps[{step_idx}]",
                 "message": f"Action '{action_ref}' is pinned to tag/branch '{ref}' instead of an immutable commit SHA.",
                 "original": uses_val
             }]
 
         return []
+
+    def _pin_rule_for_action(self, uses_val: str) -> str:
+        """Return the most specific pin rule ID for ``uses_val``.
+
+        Falls back to ``pin-action-sha`` when no specialized rule is configured
+        or when the action doesn't match a specialized category.
+        """
+        rules = self.rules_config.get("rules", {}) if isinstance(self.rules_config, dict) else {}
+        ref = uses_val.split("@", 1)[0]
+        if "pin-setup-actions-sha" in rules and ref.startswith("actions/setup-"):
+            return "pin-setup-actions-sha"
+        if "pin-artifact-actions-sha" in rules and ref in (
+            "actions/upload-artifact", "actions/download-artifact", "actions/cache",
+        ):
+            return "pin-artifact-actions-sha"
+        return "pin-action-sha"
 
     def _rule_applies(self, rule_id: str) -> bool:
         """Check a rule's applies_to against the current workflow scope (Phase 5)."""
@@ -257,9 +281,14 @@ class StaticAnalyzer:
         if not run_val or not isinstance(run_val, str):
             return []
 
+        # Strip comment lines/inline comments first so a $CI_* token appearing
+        # only in a comment (e.g. a developer's note about the violation) is
+        # not flagged and does not produce a duplicate finding for the real
+        # occurrence on a code line.
+        noiseless = _strip_noise(run_val)
         # Word-boundary-aware: capture $CI_FOO or ${CI_FOO} but not
         # $CI_FOO_BACKUP or other tokens that share a prefix.
-        for match in re.finditer(r"\$\{?CI_[A-Za-z0-9_]+\}?(?![A-Za-z0-9_])", run_val):
+        for match in re.finditer(r"\$\{?CI_[A-Za-z0-9_]+\}?(?![A-Za-z0-9_])", noiseless):
             token = match.group(0)
             findings.append({
                 "rule": "residual-gitlab-vars",
@@ -362,11 +391,15 @@ class StaticAnalyzer:
                 continue
             shell = step.get("shell")
             run_cmd = step["run"]
+            # Strip comments so a Linux utility name in a comment does not flag.
+            noiseless = _strip_noise(run_cmd) if isinstance(run_cmd, str) else run_cmd
 
             if is_windows and not shell:
-                # Windows default is pwsh/cmd — flag Linux utilities without shell: bash
+                # Windows default is pwsh/cmd — flag Linux utilities without shell: bash.
+                # Use word boundaries (or compound tokens like "rm -rf") so that
+                # "tar" does not match "tariff" and "sed" does not match "session".
                 linux_cmds = ["grep", "sed", "awk", "export", "rm -rf", "mkdir -p", "tar", "zip"]
-                found = [c for c in linux_cmds if c in run_cmd]
+                found = [c for c in linux_cmds if re.search(r"(?<![A-Za-z])" + re.escape(c) + r"(?![A-Za-z])", noiseless)]
                 if found:
                     findings.append({
                         "rule": "runner-shell-misalignment",
@@ -383,8 +416,8 @@ class StaticAnalyzer:
                     "Write-Output", "Invoke-WebRequest", "Get-Content",
                 ]
                 win_cmds = ["powershell.exe", "cmd.exe", "winget", "msiexec"]
-                found_pwsh = [c for c in pwsh_cmds if c in run_cmd]
-                found_win  = [c for c in win_cmds  if c.lower() in run_cmd.lower()]
+                found_pwsh = [c for c in pwsh_cmds if c in noiseless]
+                found_win  = [c for c in win_cmds  if c.lower() in noiseless.lower()]
                 all_found  = found_pwsh + found_win
                 if all_found:
                     findings.append({
@@ -454,9 +487,39 @@ class StaticAnalyzer:
         When a workflow declares `permissions: { contents: read }` and a job
         declares `permissions: { contents: write, issues: read }`, the job
         silently re-widens the scope, violating the least-privilege intent (A6).
+        Also handles the string forms ``read-all`` and ``write-all`` for the
+        workflow-level permissions: ``read-all`` is treated as read-only for
+        every scope and ``write-all`` as write for every scope, so a job that
+        widens a scope beyond the string default is still flagged.
         """
         workflow_perms = raw_data.get("permissions")
-        if not isinstance(workflow_perms, dict):
+        # Normalize a string workflow-level permission into a per-scope view.
+        # GitHub only recognizes "read-all" and "write-all" as string forms.
+        workflow_perm_map: dict[str, str] = {}
+        if isinstance(workflow_perms, dict):
+            workflow_perm_map = dict(workflow_perms)
+        elif isinstance(workflow_perms, str):
+            if workflow_perms == "write-all":
+                # Treat as write for every common scope.
+                workflow_perm_map = {
+                    s: "write" for s in (
+                        "contents", "packages", "actions", "deployments",
+                        "id-token", "pull-requests", "issues", "statuses",
+                        "checks", "security-events", "attestations",
+                    )
+                }
+            elif workflow_perms == "read-all":
+                workflow_perm_map = {
+                    s: "read" for s in (
+                        "contents", "packages", "actions", "deployments",
+                        "id-token", "pull-requests", "issues", "statuses",
+                        "checks", "security-events", "attestations",
+                    )
+                }
+        if not workflow_perm_map:
+            # No workflow-level permissions (or a malformed value): the
+            # least-privilege rule already flags the missing block; escalation
+            # has no baseline to compare against.
             return []
         job_perms = job_data.get("permissions")
         if not isinstance(job_perms, dict):
@@ -464,7 +527,7 @@ class StaticAnalyzer:
 
         findings = []
         for scope, job_value in job_perms.items():
-            workflow_value = workflow_perms.get(scope)
+            workflow_value = workflow_perm_map.get(scope)
             if workflow_value is None:
                 # Job declares a scope not declared at workflow level — escalation
                 findings.append({
@@ -630,19 +693,22 @@ class StaticAnalyzer:
         findings = []
 
         # Cosign Sign verification check:
-        # Enforce that signing is done against digest, not tag
-        if "cosign" in uses_val or (step.get("run") and "cosign sign" in step.get("run")):
-            run_cmd = step.get("run", "")
-            if run_cmd and "cosign sign" in run_cmd:
-                # Simple check: does it sign using digest format e.g. '@sha256:'
-                # If they do: cosign sign --yes registry/img:${TAG} it's mutable. It should contain @sha or @${{ steps... }}
-                if "@sha256:" not in run_cmd and "@$" not in run_cmd:
-                    findings.append({
-                        "rule": "image-signing",
-                        "location": f"jobs.{job_id}.steps[{step_idx}]",
-                        "message": "Cosign signing should target container image with its immutable digest '@sha256:...' instead of tag.",
-                        "original": run_cmd
-                    })
+        # Enforce that signing is done against digest, not tag.
+        # Strip comments and require "cosign sign" at a command position so a
+        # marker appearing only in an echo/documentation string is not flagged.
+        raw_run = step.get("run", "")
+        run_cmd = _strip_noise(raw_run) if isinstance(raw_run, str) else ""
+        cosign_invoked = _command_marker_present("cosign sign", run_cmd) or "cosign" in uses_val
+        if cosign_invoked and run_cmd and _command_marker_present("cosign sign", run_cmd):
+            # Simple check: does it sign using digest format e.g. '@sha256:'
+            # If they do: cosign sign --yes registry/img:${TAG} it's mutable. It should contain @sha or @${{ steps... }}
+            if "@sha256:" not in run_cmd and "@$" not in run_cmd:
+                findings.append({
+                    "rule": "image-signing",
+                    "location": f"jobs.{job_id}.steps[{step_idx}]",
+                    "message": "Cosign signing should target container image with its immutable digest '@sha256:...' instead of tag.",
+                    "original": run_cmd
+                })
 
         return findings
 
@@ -841,13 +907,18 @@ class StaticAnalyzer:
         return []
 
     def _check_step_timeout(self, job_id, idx, step):
-        """Flag long run: steps without timeout-minutes."""
+        """Flag long run: steps without timeout-minutes.
+
+        Counts only real (non-comment) lines so a heavily-commented but short
+        script is not flagged. Comment stripping reuses ``_strip_noise``.
+        """
         if "run" not in step:
             return []
         if "timeout-minutes" in step:
             return []
         run_cmd = str(step.get("run", ""))
-        lines = [l for l in run_cmd.split("\n") if l.strip()]
+        noiseless = _strip_noise(run_cmd)
+        lines = [l for l in noiseless.split("\n") if l.strip()]
         if len(lines) > 15:
             return [{
                 "rule": "step-timeout-missing",
@@ -900,15 +971,24 @@ class StaticAnalyzer:
         return []
 
     def _check_untrusted_input_injection(self, job_id, idx, step):
-        """Flag GITHUB_ENV/GITHUB_OUTPUT writes from untrusted context expressions."""
+        """Flag GITHUB_ENV/GITHUB_OUTPUT writes from untrusted context expressions.
+
+        The untrusted expression and the ``>> $GITHUB_ENV`` / ``>> $GITHUB_OUTPUT``
+        redirection may appear on the same line OR across a line continuation
+        (a trailing backslash, common for long ``echo`` statements). Comments
+        are stripped first.
+        """
         run_cmd = step.get("run")
         if not run_cmd or not isinstance(run_cmd, str):
             return []
-        # Match: untrusted github context → $GITHUB_ENV or $GITHUB_OUTPUT
+        noiseless = _strip_noise(run_cmd)
+        # Match: untrusted github context → (optional line continuation) → $GITHUB_ENV/$GITHUB_OUTPUT
         untrusted = r"""\$\{\{\s*github\.(event\.\w+[\.\w]*|head_ref|pull_request\.\w+|issue\.\w+)\s*\}\}"""
-        env_sink = re.compile(untrusted + r""".*>>\s*["']?\$GITHUB_ENV["']?""")
-        output_sink = re.compile(untrusted + r""".*>>\s*["']?\$GITHUB_OUTPUT["']?""")
-        if env_sink.search(run_cmd) or output_sink.search(run_cmd):
+        # Allow optional backslash-newline continuation between the expression and the redirection.
+        cont = r"""(?:\s*\\\s*\n\s*)?"""
+        env_sink = re.compile(untrusted + r""".*""" + cont + r""">>\s*["']?\$GITHUB_ENV["']?""", re.DOTALL)
+        output_sink = re.compile(untrusted + r""".*""" + cont + r""">>\s*["']?\$GITHUB_OUTPUT["']?""", re.DOTALL)
+        if env_sink.search(noiseless) or output_sink.search(noiseless):
             return [{
                 "rule": "untrusted-input-injection",
                 "location": f"jobs.{job_id}.steps[{idx}]",
@@ -961,9 +1041,15 @@ class StaticAnalyzer:
                     has_oidc = True
                     break
                 run_cmd = step.get("run", "")
-                if isinstance(run_cmd, str) and any(a in run_cmd for a in OIDC_SCRIPTS):
-                    has_oidc = True
-                    break
+                if isinstance(run_cmd, str):
+                    # Strip comments so a script that merely documents an aws
+                    # command in a comment is not misread as an OIDC step, and
+                    # use a command-position check so the marker inside an
+                    # ``echo "aws configure set ..."`` argument is not matched.
+                    noiseless = _strip_noise(run_cmd)
+                    if any(_command_marker_present(a, noiseless) for a in OIDC_SCRIPTS):
+                        has_oidc = True
+                        break
             if not has_oidc:
                 continue
             job_perms = job_data.get("permissions")
@@ -1089,13 +1175,24 @@ class StaticAnalyzer:
         return findings
 
     def _check_secret_in_run_literal(self, job_id, idx, step):
-        """Flag hardcoded credentials embedded in run: scripts."""
+        """Flag hardcoded credentials embedded in run: scripts.
+
+        GitHub Actions expression references (``${{ secrets.* }}`` /
+        ``${{ env.* }}`` / ``${{ github.* }}``) are explicitly excluded: a
+        properly-interpolated secret reference is NOT a hardcoded literal, even
+        when written without internal spaces (e.g. ``${{secrets.PW}}``). Only
+        bare literal values assigned to credential-like keys trigger a finding.
+        """
         run_val = step.get("run")
         if not run_val or not isinstance(run_val, str):
             return []
         noiseless = _strip_noise(run_val)
+        # Drop GitHub Actions expression interpolations before scanning so a
+        # ``${{secrets.PW}}`` (no spaces) is not misread as a hardcoded literal
+        # by the generic "password=..." pattern.
+        exprless = re.sub(r"\$\{\{[^}]*\}\}", "", noiseless)
         for pattern in _SECRET_LITERAL_PATTERNS:
-            if pattern.search(noiseless):
+            if pattern.search(exprless):
                 return [{
                     "rule": "secret-in-run-literal",
                     "location": f"jobs.{job_id}.steps[{idx}]",
@@ -1105,11 +1202,33 @@ class StaticAnalyzer:
         return []
 
     def _check_secret_echoed_in_logs(self, job_id, idx, step):
-        """Flag ${{ secrets.* }} interpolated directly into run: (echoed in logs)."""
+        """Flag ${{ secrets.* }} interpolated directly into run: (echoed in logs).
+
+        A direct ``${{ secrets.NAME }}`` reference in ``run:`` is echoed in the
+        workflow log. The safe pattern is to bind it through ``env:`` and
+        reference ``$NAME`` instead. We only flag references whose secret name
+        is NOT bound in the step's ``env:`` block (so a properly-bound secret
+        does not produce a false positive). Comment lines are stripped first so
+        commented-out references don't trigger findings.
+        """
         run_val = step.get("run")
         if not run_val or not isinstance(run_val, str):
             return []
-        if re.search(r"\$\{\{\s*secrets\.", run_val) and "env:" not in step:
+        noiseless = _strip_noise(run_val)
+        bound = set()
+        env_block = step.get("env")
+        if isinstance(env_block, dict):
+            for v in env_block.values():
+                if isinstance(v, str):
+                    m = re.search(r"\$\{\{\s*secrets\.([A-Za-z0-9_]+)\s*\}\}", v)
+                    if m:
+                        bound.add(m.group(1))
+        unflagged = False
+        for m in re.finditer(r"\$\{\{\s*secrets\.([A-Za-z0-9_]+)\s*\}\}", noiseless):
+            if m.group(1) in bound:
+                unflagged = True
+                continue
+            # At least one secret reference is not bound via env → flag once.
             return [{
                 "rule": "secret-echoed-in-logs",
                 "location": f"jobs.{job_id}.steps[{idx}]",
@@ -1119,12 +1238,18 @@ class StaticAnalyzer:
         return []
 
     def _check_expression_in_run_injection(self, job_id, idx, step):
-        """Flag untrusted ${{ github.event.* }} expressions in run: scripts."""
+        """Flag untrusted ${{ github.event.* }} expressions in run: scripts.
+
+        Comment lines are stripped first so a ``${{ github.event.* }}`` that
+        appears only in a comment (e.g. a developer note) is not flagged, and so
+        the same expression in code is not double-counted.
+        """
         run_val = step.get("run")
         if not run_val or not isinstance(run_val, str):
             return []
+        noiseless = _strip_noise(run_val)
         # Find expression interpolations in the run script.
-        exprs = _RUNEXPR_RE.findall(run_val)
+        exprs = _RUNEXPR_RE.findall(noiseless)
         if not exprs:
             return []
         # Untrusted contexts that should never be interpolated directly in run:.
@@ -1227,13 +1352,22 @@ class StaticAnalyzer:
         return findings
 
     def _check_missing_set_x_pipefail(self, job_id, idx, step):
-        """Flag multi-line bash run: scripts lacking 'set -e -o pipefail'."""
+        """Flag multi-line bash run: scripts lacking 'set -e -o pipefail'.
+
+        Comment lines are stripped first so a commented-out script body does
+        not trip the line-count threshold, and a ``set -e`` appearing only in a
+        comment does not satisfy the check. A step is considered compliant only
+        when BOTH ``set -e`` AND ``set -o pipefail`` appear in the first real
+        lines (the rule is specifically about the combined ``set -e -o pipefail``
+        guard); ``set -e`` alone still leaves pipefail-masked failures.
+        """
         if not self._rule_applies("missing-set-x-pipefail"):
             return []
         run_val = step.get("run")
         if not run_val or not isinstance(run_val, str):
             return []
-        lines = [l for l in run_val.split("\n") if l.strip()]
+        noiseless = _strip_noise(run_val)
+        lines = [l for l in noiseless.split("\n") if l.strip()]
         if len(lines) < 3:
             return []
         shell = str(step.get("shell", "")).lower()
@@ -1241,9 +1375,14 @@ class StaticAnalyzer:
         if shell and shell not in ("bash", "sh"):
             return []
         first_lines = " ".join(lines[:2]).lower()
-        if "set -e" in first_lines or "set -o pipefail" in first_lines:
+        # The script is considered guarded only when it sets BOTH errexit and
+        # pipefail in the first real lines. Match the common spellings:
+        #   set -e -o pipefail / set -o pipefail -e / set -eo pipefail /
+        #   set -euo pipefail / set -eoux... pipefail, etc.
+        has_set_e = bool(re.search(r"(^|\s)-(\w*)e(\w*)\b", first_lines))
+        has_pipefail = "pipefail" in first_lines
+        if has_set_e and has_pipefail:
             return []
-        # Skip if there's an explicit `if:` guarding the whole step.
         return [{
             "rule": "missing-set-x-pipefail",
             "location": f"jobs.{job_id}.steps[{idx}]",
@@ -1252,12 +1391,19 @@ class StaticAnalyzer:
         }]
 
     def _check_token_passed_to_third_party(self, raw_data):
-        """Flag GITHUB_TOKEN/secrets passed via env: to non-first-party actions."""
+        """Flag GITHUB_TOKEN/secrets passed to non-first-party actions.
+
+        Inspects both ``env:`` and ``with:`` blocks: tokens are commonly passed
+        to actions via ``with:`` (e.g. ``with: {token: ${{ secrets.GH_TOKEN }}}``)
+        as well as via ``env:``. Only the union of both is checked so the more
+        common ``with:`` path is not missed.
+        """
         if not self._rule_applies("token-passed-to-third-party"):
             return []
         jobs = raw_data.get("jobs", {})
         if not isinstance(jobs, dict):
             return []
+        secret_re = re.compile(r"\$\{\{\s*(secrets\.|github\.token|env\.GITHUB_TOKEN)")
         findings = []
         for job_id, job_data in jobs.items():
             if not isinstance(job_data, dict):
@@ -1272,13 +1418,15 @@ class StaticAnalyzer:
                 if not uses_val or "@" not in uses_val:
                     continue
                 action_ref = uses_val.split("@", 1)[0]
-                env_block = step.get("env")
-                if not isinstance(env_block, dict):
-                    continue
-                token_refs = [
-                    k for k, v in env_block.items()
-                    if isinstance(v, str) and re.search(r"\$\{\{\s*(secrets\.|github\.token|env\.GITHUB_TOKEN)", v)
-                ]
+                # Collect token refs from both env: and with: blocks.
+                token_refs: list[str] = []
+                for block_name in ("env", "with"):
+                    block = step.get(block_name)
+                    if not isinstance(block, dict):
+                        continue
+                    for k, v in block.items():
+                        if isinstance(v, str) and secret_re.search(v):
+                            token_refs.append(k)
                 if not token_refs:
                     continue
                 # First-party orgs are trusted.
@@ -1288,7 +1436,7 @@ class StaticAnalyzer:
                     "rule": "token-passed-to-third-party",
                     "location": f"jobs.{job_id}.steps[{idx}]",
                     "message": (
-                        f"Token/secret passed via env to third-party action '{action_ref}'. "
+                        f"Token/secret passed to third-party action '{action_ref}'. "
                         "Audit the action's trust level; third-party actions can exfiltrate credentials."
                     ),
                     "original": ", ".join(token_refs),
@@ -1360,10 +1508,18 @@ def _strip_noise(text: str) -> str:
         stripped = line.lstrip()
         if stripped.startswith("#"):
             continue
-        # Strip trailing inline comment (naive: first unquoted #).
+        # Strip trailing inline comment: the first unquoted '#'. The quote
+        # state machine respects backslash escaping inside double quotes so
+        # an escaped quote (``\"``) does not toggle the in-double state.
         in_single = in_double = False
         cut = len(line)
-        for i, ch in enumerate(line):
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if ch == "\\" and in_double and not in_single:
+                # Skip the escaped char inside double quotes.
+                i += 2
+                continue
             if ch == "'" and not in_double:
                 in_single = not in_single
             elif ch == '"' and not in_single:
@@ -1371,5 +1527,28 @@ def _strip_noise(text: str) -> str:
             elif ch == "#" and not in_single and not in_double:
                 cut = i
                 break
+            i += 1
         out_lines.append(line[:cut])
     return "\n".join(out_lines)
+
+
+def _command_marker_present(marker: str, script: str) -> bool:
+    """Return True if ``marker`` appears as an actual shell command in ``script``.
+
+    Distinguishes a real command invocation from the marker merely appearing
+    inside an ``echo`` argument or other quoted string. A marker is considered
+    present when it begins at a command position: the start of a (non-comment)
+    line, or just after a shell control operator (``&&``, ``||``, ``;``, ``|``,
+    ``$(...)``) — optionally preceded by ``sudo``/``if``/``while``. Markers
+    inside ``echo "..."`` / ``echo '...'`` arguments are ignored.
+    """
+    if not script or not marker:
+        return False
+    marker_re = re.escape(marker)
+    # Command positions: line start, or after a shell operator. Allow an
+    # optional 'sudo ' or 'if '/'while ' prefix before the marker.
+    pattern = re.compile(
+        r"(?:^|[\n;&|])\s*(?:sudo\s+|if\s+|while\s+|then\s+|do\s+)*"
+        + marker_re
+    )
+    return bool(pattern.search(script))

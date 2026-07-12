@@ -283,7 +283,7 @@ class ReportGenerator:
                         "text": _RULE_SUMMARIES.get(rule_id, rule_id)
                     },
                     "helpUri": (
-                        f"https://github.com/anomalyco/opencode/blob/main/docs/rules/{rule_id}.md"
+                        f"https://github.com/SuhaasNandeesh/github-workflow-checks/blob/main/docs/rules/{rule_id}.md"
                     ),
                 }
             level_map = {"error": "error", "warning": "warning", "info": "note"}
@@ -319,7 +319,7 @@ class ReportGenerator:
                         "name": "github-actions-checks",
                         "version": "1.0.0",
                         "informationUri": (
-                            "https://github.com/anomalyco/opencode"
+                            "https://github.com/SuhaasNandeesh/github-workflow-checks"
                         ),
                         "rules": list(rules_index.values()),
                     }

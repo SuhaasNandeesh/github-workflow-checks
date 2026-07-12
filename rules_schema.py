@@ -81,12 +81,12 @@ SCHEMA: dict[str, Any] = {
         },
         "suppressions": {
             "type": "object",
-            "required": ["global", "by_repository"],
             "additionalProperties": False,
             "properties": {
                 "global": {
                     "type": "array",
                     "items": {"type": "string"},
+                    "default": [],
                 },
                 "by_repository": {
                     "type": "object",
@@ -94,6 +94,7 @@ SCHEMA: dict[str, Any] = {
                         "type": "array",
                         "items": {"type": "string"},
                     },
+                    "default": {},
                 },
             },
         },

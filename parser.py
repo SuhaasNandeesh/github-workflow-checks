@@ -39,9 +39,31 @@ class WorkflowParser:
             ) from e
 
     def save_workflow(self, filepath, data):
-        """Saves a workflow data structure back to disk using ruamel.yaml to preserve formatting."""
-        with open(filepath, 'w', encoding='utf-8') as f:
-            self.yaml.dump(data, f)
+        """Saves a workflow data structure back to disk atomically.
+
+        Writes to a sibling temp file first, fsyncs, then ``os.replace`` onto
+        the target path so a crash mid-write never leaves a truncated/corrupted
+        workflow file (the previous file is either intact or fully replaced).
+        """
+        tmp_path = f"{filepath}.tmp"
+        try:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                self.yaml.dump(data, f)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    # fsync is best-effort on some filesystems / platforms.
+                    pass
+            os.replace(tmp_path, filepath)
+        except Exception:
+            # Clean up the temp file on any failure so we never leave a stale
+            # ``<file>.tmp`` behind. Swallow the unlink error (file may not exist).
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def extract_ast_summary(self, data, *, flagged_step_locations=None):
         """Extracts a token-minimized JSON-serializable AST summary of the workflow.

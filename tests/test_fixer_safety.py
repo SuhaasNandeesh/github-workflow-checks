@@ -40,7 +40,7 @@ def test_fix_mode_creates_bak_file(workspace: Path, clean_env, orchestrator) -> 
             "original": "missing",
         }
     ]
-    orchestrator._handle_fix_mode(workflow, workflow_data, violations)
+    orchestrator._handle_fix_mode(orchestrator.parser, workflow, workflow_data, violations)
     bak = workflow.with_suffix(workflow.suffix + ".bak")
     assert bak.exists()
     assert bak.read_text() == original

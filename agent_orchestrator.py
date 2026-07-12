@@ -47,15 +47,28 @@ _EXIT_AUTH = 4
 _EXIT_BUDGET = 5
 
 # Rules that the orchestrator can fix programmatically (0 credit cost). Any
-# other rule with a finding is routed to the LLM Fixer agent. Note:
-# pin-action-sha is intentionally NOT in this set — resolving a tag to a commit
-# SHA requires the GitHub API, which is not available in fully-offline runs.
-# Unpinned actions are reported as findings (manual-review.json) instead.
+# other rule with a finding is routed to the LLM Fixer agent (when semantic
+# audit is active) or to manual-review.json.
 _PROGRAMMATIC_FIX_RULES = frozenset({
     "residual-gitlab-vars",
     "runner-shell-misalignment",
     "least-privilege-token",
     "concurrency-control",
+})
+
+# Rules that must NEVER be routed to the LLM Fixer because resolving them
+# correctly requires data unavailable offline (e.g. resolving an action tag to
+# an immutable commit SHA needs the GitHub API). The LLM would hallucinate a
+# placeholder SHA (e.g. ``@<commit-sha>``) or invent a 40-char hex string; the
+# orchestrator would then write that broken ref to disk. These rules are always
+# written to ``manual-review.json`` so the owning team can remediate by hand,
+# matching the README contract.
+_MANUAL_REVIEW_ONLY_RULES = frozenset({
+    "pin-action-sha",
+    "pin-setup-actions-sha",
+    "pin-artifact-actions-sha",
+    "reusable-workflow-pinned",
+    "docker-action-digest-pin",
 })
 
 # Max to-and-fro iterations for the LLM Fixer on a single file before giving up.
@@ -128,6 +141,7 @@ class AgentOrchestrator:
         self._credits_lock = threading.Lock()
         self._db_lock = threading.Lock()
         self._audit_lock = threading.Lock()
+        self._stdout_lock = threading.Lock()
 
     def _check_budget(self) -> None:
         """Raise BudgetExhaustedError if credit budget is exhausted (exit code 5)."""
@@ -248,9 +262,24 @@ class AgentOrchestrator:
 
         def _process_one(workflow_path: Path) -> tuple[str, str, int | str, dict[str, Any] | None]:
             """Process a single workflow file. Returns (rel_path, repo_name, result, payload_or_None)."""
+            # Each worker gets its own parser AND static analyzer so that the
+            # shared ``self.static_analyzer`` instance state (``_scope`` /
+            # ``_workflow_env``) and the shared ``self.parser`` ruamel.yaml
+            # engine are never mutated concurrently across threads. The config
+            # is read-only and safe to share.
             parser = WorkflowParser()
+            analyzer = StaticAnalyzer(
+                rules_config=self.rules_config,
+                token=os.environ.get("GITHUB_TOKEN") or os.environ.get("COPILOT_TOKEN"),
+                endpoint=self.endpoint,
+            )
             rel_path = str(workflow_path.relative_to(target))
             repo_name = rel_path.split(os.sep)[0] if os.sep in rel_path else "root"
+            # Namespace the state-DB key by mode so that a completed ``report``
+            # run does NOT cause a subsequent ``fix`` run to skip the same files
+            # (each mode tracks its own resume state). Otherwise fixes would
+            # never be applied after a report run without ``--reset``.
+            db_key = f"{self.mode}::{rel_path}"
 
             try:
                 mtime = workflow_path.stat().st_mtime
@@ -264,8 +293,8 @@ class AgentOrchestrator:
                 content_sha = ""
 
             with self._db_lock:
-                if self.state_db.should_skip(rel_path, mtime, content_sha):
-                    entry = self.state_db.get(rel_path) or {}
+                if self.state_db.should_skip(db_key, mtime, content_sha):
+                    entry = self.state_db.get(db_key) or {}
                     logger.info("Skipping already processed workflow (resume mode): %s", rel_path)
                     return rel_path, repo_name, entry.get("violations_count", 0), entry
 
@@ -280,7 +309,7 @@ class AgentOrchestrator:
             except Exception as e:
                 logger.error("Failed to parse %s: %s", rel_path, e)
                 with self._db_lock:
-                    self.state_db.record(rel_path, mtime, content_sha, {
+                    self.state_db.record(db_key, mtime, content_sha, {
                         "status": "failed",
                         "error": str(e),
                         "timestamp": _utcnow_iso(),
@@ -291,12 +320,9 @@ class AgentOrchestrator:
             try:
                 # Phase 2: file-based inter-agent communication.
                 # Stage 1 — Static Auditor (0 credit) writes .static.json.
-                flagged_locations = {
-                    v.get("location") for v in (
-                        self.static_analyzer.analyze_workflow(workflow_path, workflow_data)
-                    ) if v.get("location")
-                }
-                violations = self.static_analyzer.analyze_workflow(workflow_path, workflow_data)
+                findings = analyzer.analyze_workflow(workflow_path, workflow_data)
+                flagged_locations = {v.get("location") for v in findings if v.get("location")}
+                violations = findings
                 self._write_audit_file(rel_path, "static.json", {
                     "file": rel_path,
                     "findings": violations,
@@ -307,7 +333,7 @@ class AgentOrchestrator:
                 # Stage 2 — Semantic Auditor (LLM) reads .static.json, writes
                 # .semantic.json with raw findings.
                 semantic = self._run_semantic_audit(
-                    workflow_data, violations, repo_name, rel_path, flagged_locations
+                    parser, workflow_data, violations, repo_name, rel_path, flagged_locations
                 )
 
                 # Stage 3 — Verifier (0 credit) cross-checks semantic findings
@@ -322,9 +348,9 @@ class AgentOrchestrator:
                 filtered = self._filter_suppressions(violations, repo_name)
 
                 if self.mode == "dry-run":
-                    self._handle_dry_run_mode(workflow_path, workflow_data, filtered)
+                    self._handle_dry_run_mode(parser, workflow_path, workflow_data, filtered)
                 elif self.mode == "fix":
-                    self._handle_fix_mode(workflow_path, workflow_data, filtered, rel_path)
+                    self._handle_fix_mode(parser, workflow_path, workflow_data, filtered, rel_path)
 
                 payload = {
                     "status": "completed",
@@ -336,7 +362,7 @@ class AgentOrchestrator:
                     "timestamp": _utcnow_iso(),
                 }
                 with self._db_lock:
-                    self.state_db.record(rel_path, mtime, content_sha, payload)
+                    self.state_db.record(db_key, mtime, content_sha, payload)
                     self.state_db.flush()
                 return rel_path, repo_name, len(filtered), payload
             except BudgetExhaustedError:
@@ -345,10 +371,12 @@ class AgentOrchestrator:
                 raise  # Let memory errors propagate for clean shutdown
             except RecursionError:
                 raise  # Let recursion errors propagate
+            except OrchestratorError:
+                raise  # validation/backup failures must surface, not be swallowed
             except Exception as e:
                 logger.error("Error processing %s: %s", rel_path, e)
                 with self._db_lock:
-                    self.state_db.record(rel_path, mtime, content_sha, {
+                    self.state_db.record(db_key, mtime, content_sha, {
                         "status": "failed",
                         "error": str(e),
                         "timestamp": _utcnow_iso(),
@@ -449,8 +477,11 @@ class AgentOrchestrator:
             severity = self._resolve_severity(rule_id)
             if severity == "ignore":
                 continue
-            v["severity"] = severity
-            filtered.append(v)
+            # Copy so we don't mutate the original finding dicts (which are also
+            # written to the .static.json audit file without severity stamps).
+            v_copy = dict(v)
+            v_copy["severity"] = severity
+            filtered.append(v_copy)
         return filtered
 
     def _audit_file_path(self, rel_path: str, suffix: str) -> Path:
@@ -479,6 +510,7 @@ class AgentOrchestrator:
 
     def _run_semantic_audit(
         self,
+        parser: WorkflowParser,
         workflow_data: Any,
         static_findings: list[dict[str, Any]],
         repo_name: str,
@@ -490,7 +522,7 @@ class AgentOrchestrator:
         The auditor reads the static findings (passed as input) and the
         targeted AST summary (with full run content for flagged steps). Raw LLM
         output is written to <rel_path>.semantic.json for auditability before
-        verification.
+        verification. ``parser`` is the per-worker parser (thread-safe).
         """
         if not self._semantic_rules_active():
             return []
@@ -501,7 +533,7 @@ class AgentOrchestrator:
             return []
         system_prompt = prompt_path.read_text(encoding="utf-8")
 
-        ast_summary = self.parser.extract_ast_summary(
+        ast_summary = parser.extract_ast_summary(
             workflow_data, flagged_step_locations=flagged_locations
         )
         # Pass the active rule catalog so the LLM only emits known rule IDs.
@@ -659,7 +691,7 @@ class AgentOrchestrator:
 
         if self.output_format == "sarif":
             content = ReportGenerator.generate_sarif(repo_name, violations)
-            target = self._resolve_output_path(report_path, "findings.sarif.json")
+            target = self._resolve_output_path(report_path, repo_name, "findings.sarif.json")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
             logger.info("SARIF report written to %s", target)
@@ -667,7 +699,7 @@ class AgentOrchestrator:
 
         if self.output_format == "junit":
             content = ReportGenerator.generate_junit(repo_name, violations)
-            target = self._resolve_output_path(report_path, "findings.junit.xml")
+            target = self._resolve_output_path(report_path, repo_name, "findings.junit.xml")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
             logger.info("JUnit report written to %s", target)
@@ -707,7 +739,7 @@ class AgentOrchestrator:
             logger.warning("Documenter prompt missing; using static fallback.")
             markdown = ReportGenerator.generate_static_report(repo_name, violations)
 
-        target = self._resolve_output_path(report_path, "findings.md")
+        target = self._resolve_output_path(report_path, repo_name, "findings.md")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(markdown, encoding="utf-8")
         logger.info(
@@ -715,13 +747,25 @@ class AgentOrchestrator:
             "llm" if used_llm else "static",
         )
 
-    def _resolve_output_path(self, default: Path, filename: str) -> Path:
+    def _resolve_output_path(self, default: Path, repo_name: str, filename: str) -> Path:
+        """Resolve where to write a report file.
+
+        When ``--output-dir`` is set, each repository writes to its own
+        namespaced file (``<repo_name>-<filename>``) so that multi-repo runs do
+        not overwrite each other's reports. When ``--output-dir`` is unset the
+        per-repo ``.github/findings.md`` path is used (no collision because each
+        repo has its own directory).
+        """
         if self.output_dir is None:
             return default
-        return self.output_dir / filename
+        # Sanitize the repo name so it is path-safe (repos are usually already
+        # safe identifiers, but guard against '.github' or any odd names).
+        safe_repo = re.sub(r"[^A-Za-z0-9._-]", "_", repo_name or "root")
+        return self.output_dir / f"{safe_repo}-{filename}"
 
     def _handle_dry_run_mode(
         self,
+        parser: WorkflowParser,
         workflow_path: Path,
         workflow_data: Any,
         violations: list[dict[str, Any]],
@@ -732,11 +776,11 @@ class AgentOrchestrator:
         self._apply_programmatic_fixes(modified_data, violations)
 
         orig_stream = io.StringIO()
-        self.parser.yaml.dump(workflow_data, orig_stream)
+        parser.yaml.dump(workflow_data, orig_stream)
         orig_str = orig_stream.getvalue()
 
         mod_stream = io.StringIO()
-        self.parser.yaml.dump(modified_data, mod_stream)
+        parser.yaml.dump(modified_data, mod_stream)
         mod_str = mod_stream.getvalue()
 
         diff = difflib.unified_diff(
@@ -747,13 +791,16 @@ class AgentOrchestrator:
         )
         diff_output = "".join(diff)
         if diff_output:
-            print("=== Proposed Changes (Dry-Run Patch) ===")
-            print(diff_output)
+            # Serialize stdout writes so parallel dry-run diffs don't interleave.
+            with self._stdout_lock:
+                print("=== Proposed Changes (Dry-Run Patch) ===")
+                print(diff_output)
         else:
             logger.info("No structural changes required for %s.", workflow_path.name)
 
     def _handle_fix_mode(
         self,
+        parser: WorkflowParser,
         workflow_path: Path,
         workflow_data: Any,
         violations: list[dict[str, Any]],
@@ -761,65 +808,95 @@ class AgentOrchestrator:
     ) -> None:
         logger.info("Remediating violations in-place for %s...", workflow_path.name)
 
-        # Split violations into programmatic (0-credit) and LLM-fixable.
+        # Split violations into three buckets:
+        #   * programmatic — deterministic 0-credit fixes.
+        #   * llm_fixable  — error-severity, non-programmatic, non-manual-only:
+        #                     routed to the LLM Fixer (when semantic audit active)
+        #                     or to manual-review (when disabled).
+        #   * manual_review — everything that should never touch the LLM:
+        #                     warning/info non-programmatic violations AND any
+        #                     rule in _MANUAL_REVIEW_ONLY_RULES (regardless of
+        #                     severity) AND error-severity violations when the
+        #                     LLM Fixer is unavailable (semantic audit off).
         programmatic = [
             v for v in violations if v.get("rule") in _PROGRAMMATIC_FIX_RULES
-        ]
-        # The LLM Fixer is expensive (to-and-fro, up to 3 attempts each). Route
-        # only error-severity, non-programmatic violations to it; warnings and
-        # infos are surfaced for manual review instead of burning credits on
-        # low-impact findings.
-        llm_fixable = [
-            v for v in violations
-            if v.get("rule") not in _PROGRAMMATIC_FIX_RULES
-            and v.get("severity") == "error"
         ]
         manual_review = [
             v for v in violations
             if v.get("rule") not in _PROGRAMMATIC_FIX_RULES
-            and v.get("severity") != "error"
+            and (
+                v.get("severity") != "error"
+                or v.get("rule") in _MANUAL_REVIEW_ONLY_RULES
+            )
+        ]
+        llm_fixable = [
+            v for v in violations
+            if v.get("rule") not in _PROGRAMMATIC_FIX_RULES
+            and v.get("severity") == "error"
+            and v.get("rule") not in _MANUAL_REVIEW_ONLY_RULES
         ]
 
         # Stage 4a — programmatic fixes (deterministic, 0 credit).
         self._apply_programmatic_fixes(workflow_data, programmatic)
 
         # Stage 4b — LLM Fixer with to-and-fro retry loop for error-severity
-        # non-programmatic violations only.
+        # non-programmatic violations only. When semantic audit is disabled the
+        # LLM Fixer is unavailable, so those error-severity violations are folded
+        # into manual-review so they are never silently dropped.
         if llm_fixable and self._semantic_rules_active():
-            self._run_llm_fixer(workflow_data, llm_fixable, rel_path)
+            self._run_llm_fixer(parser, workflow_data, llm_fixable, rel_path)
         elif llm_fixable:
+            manual_review.extend(llm_fixable)
             logger.info(
                 "Skipping LLM Fixer (semantic audit disabled); %d error "
-                "violation(s) in %s cannot be auto-fixed.",
+                "violation(s) in %s flagged for manual review.",
                 len(llm_fixable), workflow_path.name,
             )
 
         if manual_review:
+            # Defensive dedupe by (rule, location): a violation could be added to
+            # manual_review twice if semantic audit is disabled (the llm_fixable
+            # bucket is folded in). Keep the first occurrence per key.
+            seen: set[tuple[str | None, str | None]] = set()
+            deduped: list[dict[str, Any]] = []
+            for v in manual_review:
+                key = (v.get("rule"), v.get("location"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(v)
             self._write_audit_file(rel_path, "manual-review.json", {
                 "file": rel_path,
                 "violations": [
                     {"rule": v.get("rule"), "location": v.get("location"),
                      "severity": v.get("severity"), "message": v.get("message")}
-                    for v in manual_review
+                    for v in deduped
                 ],
                 "timestamp": _utcnow_iso(),
             })
             logger.info(
-                "%d warning/info violation(s) in %s flagged for manual "
+                "%d violation(s) in %s flagged for manual "
                 "review (see .actions_audit/<file>.manual-review.json).",
-                len(manual_review), workflow_path.name,
+                len(deduped), workflow_path.name,
             )
 
         # Validate the post-remediation YAML round-trips before any disk write.
         stream = io.StringIO()
         try:
-            self.parser.yaml.dump(workflow_data, stream)
+            parser.yaml.dump(workflow_data, stream)
             rendered = stream.getvalue()
-            self.parser.yaml.load(rendered)
+            parser.yaml.load(rendered)
         except Exception as e:
             logger.error("Parser validation failed post-remediation: %s", e)
             logger.error("Aborting to prevent corruption; no file written.")
-            raise OrchestratorError(f"Parser validation failed for {workflow_path.name}; aborting to prevent corruption.")
+            raise OrchestratorError(f"Parser validation failed for {workflow_path.name}; aborting to prevent corruption.") from e
+
+        # Only write to disk if there is at least one violation to remediate.
+        # Writing unconditionally would bump the file mtime and invalidate the
+        # resume cache for subsequent runs (and burn IO on compliant files).
+        if not violations:
+            logger.info("No violations to remediate for %s; leaving file untouched.", workflow_path.name)
+            return
 
         if self.backup:
             backup_path = workflow_path.with_suffix(workflow_path.suffix + ".bak")
@@ -830,16 +907,22 @@ class AgentOrchestrator:
                 logger.info("Backup written to %s", backup_path)
             except OSError as e:
                 logger.error("Failed to create backup at %s: %s", backup_path, e)
-                raise OrchestratorError(f"Backup failed for {workflow_path.name}; aborting.")
+                raise OrchestratorError(f"Backup failed for {workflow_path.name}; aborting.") from e
 
         try:
-            self.parser.save_workflow(workflow_path, workflow_data)
+            parser.save_workflow(workflow_path, workflow_data)
             logger.info("Remediation written to %s", workflow_path)
         except OSError as e:
+            # A failed write must NOT be silently recorded as "completed" —
+            # otherwise the state DB would skip the file on resume and the fix
+            # would be permanently lost. Re-raise so _process_one records the
+            # failure (the .bak, if created, remains for manual recovery).
             logger.error("Failed to write %s: %s", workflow_path, e)
+            raise OrchestratorError(f"Failed to write {workflow_path.name}: {e}") from e
 
     def _run_llm_fixer(
         self,
+        parser: WorkflowParser,
         workflow_data: Any,
         violations: list[dict[str, Any]],
         rel_path: str,
@@ -928,14 +1011,22 @@ class AgentOrchestrator:
                     prev_patch = None
                     prev_error = "patch is not a JSON array"
                     continue
+                if not patch:
+                    # An empty patch means the LLM declined to fix (or couldn't).
+                    # Record it as "no_fix" rather than "applied" so the audit
+                    # log is honest and the violation is routed to manual review
+                    # rather than being silently left in place.
+                    prev_patch = patch
+                    prev_error = "empty patch (no fix produced)"
+                    continue
                 prev_patch = patch
                 # Apply the patch to a deepcopy first; validate round-trip.
                 candidate = copy.deepcopy(workflow_data)
                 try:
                     _apply_json_patch(candidate, patch, location)
                     test_stream = io.StringIO()
-                    self.parser.yaml.dump(candidate, test_stream)
-                    self.parser.yaml.load(test_stream.getvalue())
+                    parser.yaml.dump(candidate, test_stream)
+                    parser.yaml.load(test_stream.getvalue())
                 except Exception as e:
                     prev_error = f"patch application/parse failed: {e}"
                     continue

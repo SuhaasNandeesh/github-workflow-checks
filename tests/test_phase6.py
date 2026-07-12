@@ -529,6 +529,7 @@ def test_fixer_writes_audit_file_on_success(tmp_path, monkeypatch):
     ]}}}
     # coverity-scan is non-programmatic, so it routes to the LLM fixer.
     orch._run_llm_fixer(
+        orch.parser,
         workflow_data,
         [{"rule": "coverity-scan", "location": "jobs.deploy.steps[0]",
           "message": "missing coverity", "remediation_hint": "add it"}],
@@ -567,6 +568,7 @@ def test_fixer_to_and_fro_retries_on_bad_patch(tmp_path):
     orch.copilot["fixer"] = _FakeClient()
     workflow_data = {"jobs": {"build": {"runs-on": "ubuntu-latest", "steps": [{"run": "echo"}]}}}
     orch._run_llm_fixer(
+        orch.parser,
         workflow_data,
         [{"rule": "coverity-scan", "location": "jobs.build.steps[0]",
           "message": "missing", "remediation_hint": "h"}],
@@ -610,7 +612,7 @@ def test_fix_mode_skips_llm_for_warning_severity(tmp_path):
     # warning-severity coverity-scan + warning environment-protection — neither
     # is programmatic, neither is error-severity → must NOT invoke the LLM.
     orch._handle_fix_mode(
-        wf, workflow_data,
+        orch.parser, wf, workflow_data,
         [
             {"rule": "coverity-scan", "severity": "warning",
              "location": "jobs.deploy.steps[0]", "message": "missing"},
@@ -651,9 +653,14 @@ def test_fix_mode_invokes_llm_for_error_severity(tmp_path):
     wf.write_text("name: x\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${{ secrets.TOKEN }}\n")
     workflow_data = orch.parser.load_workflow(wf)
     orch._handle_fix_mode(
-        wf, workflow_data,
+        orch.parser, wf, workflow_data,
         [{"rule": "secret-echoed-in-logs", "severity": "error",
           "location": "jobs.build.steps[0]", "message": "echoed secret"}],
         "build.yml",
     )
-    assert invoked["n"] == 1, "LLM Fixer must be invoked once for an error-severity violation"
+    assert invoked["n"] >= 1, "LLM Fixer must be invoked for an error-severity violation"
+    # The Fixer retries up to _FIXER_MAX_ITERATIONS when the LLM keeps returning
+    # an empty patch (no fix produced). With this stub always returning "[]", the
+    # violation is ultimately recorded as failed (not silently applied).
+    from agent_orchestrator import _FIXER_MAX_ITERATIONS
+    assert invoked["n"] <= _FIXER_MAX_ITERATIONS

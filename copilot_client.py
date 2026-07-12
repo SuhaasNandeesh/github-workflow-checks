@@ -114,11 +114,21 @@ class CopilotClient:
             os.path.join(home, ".config", "github-copilot", "hosts.json"),
             os.path.join(home, "AppData", "Local", "github-copilot", "hosts.json"),
         ):
-            token = self._read_oauth_from_json(
-                path, keys=("oauth_token",), nested_keys=("github.com",)
-            )
-            if token:
-                return token
+            # For GHES, the OAuth session is stored under the GHES hostname
+            # (e.g. "github.mycompany.com"); for github.com it is under
+            # "github.com". Try the GHES host first (if configured), then fall
+            # back to "github.com".
+            hosts_to_try: list[str] = []
+            ghes_host = self._ghes_host()
+            if ghes_host and ghes_host != "github.com":
+                hosts_to_try.append(ghes_host)
+            hosts_to_try.append("github.com")
+            for host in hosts_to_try:
+                token = self._read_oauth_from_json(
+                    path, keys=("oauth_token",), nested_keys=(host,)
+                )
+                if token:
+                    return token
 
         # Final fallback: gh auth token (default host, or GHES host if endpoint set)
         try:
